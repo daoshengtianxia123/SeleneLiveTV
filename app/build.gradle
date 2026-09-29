@@ -10,8 +10,8 @@ android {
         applicationId 'com.daosheng.selenelivetv'
         minSdk 28
         targetSdk 35
-        versionCode 9
-        versionName '1.4.3-android9-mpv-cachefirst'
+        versionCode 10
+        versionName '1.4.4-android9-mpv-diagnostics'
         ndk { abiFilters 'armeabi-v7a' }
     }
 }
