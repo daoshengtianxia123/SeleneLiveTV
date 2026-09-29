@@ -22,6 +22,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
@@ -43,6 +46,7 @@ public class MainActivity extends Activity {
     public static final String KEY_SUB_URL = "subscription_url";
     private static final String KEY_CACHE = "playlist_cache";
     private static final String KEY_CACHE_TIME = "playlist_cache_time";
+    private static final String CACHE_FILE_NAME = "playlist_cache.m3u";
     private static final String KEY_LAST = "last_channel";
     private static final long CACHE_REFRESH_INTERVAL_MS = 6L * 60L * 60L * 1000L;
 
@@ -422,8 +426,9 @@ public class MainActivity extends Activity {
                 "【直播调试】\n" +
                 "频道：" + channelName + "\n" +
                 "阶段：" + debugStage + "\n" +
+                "订阅：本地缓存优先 / 后台更新\n" +
                 "事件：" + debugLastEvent + "\n" +
-                "服务器：" + currentHost() + "\n" +
+                "直播源：" + currentHost() + "\n" +
                 "缓存：" + buffer + "  已缓存：" + cache + "\n" +
                 "视频：" + debugVideoCodec + " / " + debugVideoFormat + " / " + resolution + "\n" +
                 "音频：" + debugAudioCodec + "\n" +
@@ -533,10 +538,11 @@ public class MainActivity extends Activity {
                 ResolvedPlaylist resolved = resolveSubscription(sub);
                 if (resolved.channels.isEmpty()) throw new IllegalStateException("新订阅没有有效频道");
 
+                writePlaylistCacheToDisk(resolved.playlistText);
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                         .putString(KEY_CACHE, resolved.playlistText)
                         .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
-                        .apply();
+                        .commit();
 
                 ui.post(() -> {
                     if (destroyed) return;
@@ -618,20 +624,86 @@ public class MainActivity extends Activity {
 
     private void loadInitial() {
         SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
-        String cache = p.getString(KEY_CACHE, "");
+
+        // 1) 优先读内部文件缓存；2) 文件没有再回退到 SharedPreferences。
+        // 只要之前成功加载过一次，启动时就绝不先等网络。
+        String cache = readPlaylistCacheFromDisk();
+        if (cache.trim().isEmpty()) {
+            cache = p.getString(KEY_CACHE, "");
+        }
+
         List<Channel> cached = PlaylistParser.parse(cache);
         if (!cached.isEmpty()) {
             setChannels(cached);
             current = Math.min(p.getInt(KEY_LAST, 0), channels.size() - 1);
-            status.setVisibility(View.GONE);
+            status.setText("正在使用本地频道缓存");
+            status.setVisibility(View.VISIBLE);
+
+            // 先播放缓存，网络更新不能阻塞启动。
             playCurrent();
 
             long cacheTime = p.getLong(KEY_CACHE_TIME, 0L);
             if (System.currentTimeMillis() - cacheTime >= CACHE_REFRESH_INTERVAL_MS) {
-                ui.postDelayed(() -> refreshSubscription(false, true), 3000);
+                // 给播放器一点启动时间，后台静默刷新。
+                ui.postDelayed(() -> refreshSubscription(false, true), 15000);
             }
-        } else {
-            refreshSubscription(true, false);
+            return;
+        }
+
+        // 完全没有任何本地缓存时，才联网获取订阅。
+        status.setText("本地没有频道缓存，正在首次加载直播订阅…");
+        status.setVisibility(View.VISIBLE);
+        refreshSubscription(true, false);
+    }
+
+    private String readPlaylistCacheFromDisk() {
+        File f = new File(getFilesDir(), CACHE_FILE_NAME);
+        if (!f.exists() || f.length() <= 0) return "";
+        try (FileInputStream in = new FileInputStream(f);
+             BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line).append('\n');
+            String text = sb.toString();
+            // 只有能解析出频道的缓存才认为有效。
+            if (!PlaylistParser.parse(text).isEmpty()) return text;
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    private boolean writePlaylistCacheToDisk(String text) {
+        if (text == null || text.trim().isEmpty()) return false;
+        File dir = getFilesDir();
+        File tmp = new File(dir, CACHE_FILE_NAME + ".tmp");
+        File dst = new File(dir, CACHE_FILE_NAME);
+        try (FileOutputStream out = new FileOutputStream(tmp, false)) {
+            out.write(text.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+        } catch (Exception e) {
+            return false;
+        }
+
+        if (!PlaylistParser.parse(readTextFile(tmp)).isEmpty()) {
+            if (dst.exists() && !dst.delete()) {
+                tmp.delete();
+                return false;
+            }
+            return tmp.renameTo(dst);
+        }
+        tmp.delete();
+        return false;
+    }
+
+    private String readTextFile(File f) {
+        try (FileInputStream in = new FileInputStream(f);
+             BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line).append('\n');
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
         }
     }
 
@@ -669,10 +741,11 @@ public class MainActivity extends Activity {
                     throw new IllegalStateException("直播列表中没有有效频道");
                 }
 
+                writePlaylistCacheToDisk(resolved.playlistText);
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                         .putString(KEY_CACHE, resolved.playlistText)
                         .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
-                        .apply();
+                        .commit();
 
                 ui.post(() -> {
                     Channel playingNow = !channels.isEmpty() && current >= 0 && current < channels.size()
