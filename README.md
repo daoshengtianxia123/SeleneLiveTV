@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-- 版本：`1.4.6-android9-mpv-debug-ui`
+- 版本：`1.4.7-android9-offline-cache`
 - 默认订阅：`https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt`
 - 支持 Selene Base58 订阅：先解码 JSON，再读取 `lives.*.url` 对应的 M3U。
 - 播放核心：`dev.jdtech.mpv:libmpv:1.0.0`（libmpv + FFmpeg）。
@@ -70,3 +70,13 @@
 - 切换频道：调试窗口重新显示。
 - 真正连续播放约 2 秒且播放进度持续增长后，调试窗口自动隐藏。
 - 若后续播放卡住并触发自动恢复，调试窗口会重新显示。
+
+
+## 离线启动缓存（1.4.7）
+
+- 成功获取直播列表后，同时写入应用内部文件 `playlist_cache.m3u` 和 SharedPreferences。
+- 启动时优先读取内部文件缓存；文件无效时再读取 SharedPreferences。
+- 只要本地存在可解析频道，启动时立即使用缓存播放，不先等待 GitHub/VPN。
+- 缓存超过 6 小时时，延迟约 15 秒后台静默刷新订阅；刷新失败不影响当前缓存播放。
+- 完全没有本地缓存时，才显示“本地没有频道缓存，正在首次加载直播订阅…”并联网获取。
+- 调试窗口把“订阅缓存”和“直播源服务器”分开显示，避免把订阅网络问题与直播源卡顿混在一起。
