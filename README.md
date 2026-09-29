@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-- 版本：`1.4.3-android9-mpv-cachefirst`
+- 版本：`1.4.4-android9-mpv-diagnostics`
 - 默认订阅：`https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt`
 - 支持 Selene Base58 订阅：先解码 JSON，再读取 `lives.*.url` 对应的 M3U。
 - 播放核心：`dev.jdtech.mpv:libmpv:1.0.0`（libmpv + FFmpeg）。
@@ -32,3 +32,15 @@
 - libmpv Android packaging: https://github.com/jarnedemeulemeester/libmpv-android
 
 许可证说明位于 `app/src/main/assets/licenses/`。
+
+
+## 屏幕播放诊断
+
+右上角会实时显示 MPV 播放阶段，用于定位直播卡顿位置：
+
+- START_FILE：已开始打开直播地址
+- FILE_LOADED：直播流已打开并完成基础解析
+- VIDEO_RECONFIG：视频解码器/视频参数已经建立
+- PLAYBACK_RESTART：实际播放已经启动或缓冲后恢复
+- 缓存百分比、缓存秒数、视频/音频编码、分辨率、播放时间
+- 若播放时间连续约 3.5 秒不增长，会直接显示“播放时间已停止”
