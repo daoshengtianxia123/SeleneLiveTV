@@ -78,6 +78,7 @@ public class MainActivity extends Activity {
     private volatile double debugTimePos = -1;
     private volatile double debugLastTimePos = -1;
     private volatile long debugLastProgressAt = 0L;
+    private volatile long debugHealthySince = 0L;
     private volatile String debugVideoCodec = "-";
     private volatile String debugVideoFormat = "-";
     private volatile String debugAudioCodec = "-";
@@ -263,6 +264,7 @@ public class MainActivity extends Activity {
                                 debugLastTimePos = value;
                                 debugLastProgressAt = System.currentTimeMillis();
                                 if (value > 0.25) {
+                                    if (!playbackHealthy) debugHealthySince = System.currentTimeMillis();
                                     playbackHealthy = true;
                                     debugStage = forceSoftwareDecode
                                             ? "4/4 软件解码正在连续播放"
@@ -338,6 +340,7 @@ public class MainActivity extends Activity {
                 debugStage = forceSoftwareDecode
                         ? "4/4 软件解码正在连续播放"
                         : "4/4 正在连续播放";
+                if (!playbackHealthy) debugHealthySince = System.currentTimeMillis();
                 playbackHealthy = true;
                 playbackRetryCount = 0;
                 debugLastProgressAt = System.currentTimeMillis();
@@ -436,6 +439,20 @@ public class MainActivity extends Activity {
             if (destroyed) return;
             updateDebugPanel();
             checkPlaybackRecovery();
+
+            // 真正持续播放满2秒，且最近仍有播放进度，就自动隐藏调试窗口。
+            long now = System.currentTimeMillis();
+            if (debugView != null &&
+                    debugView.getVisibility() == View.VISIBLE &&
+                    playbackHealthy &&
+                    !debugPausedForCache &&
+                    debugHealthySince > 0 &&
+                    now - debugHealthySince >= 2000 &&
+                    debugLastProgressAt > 0 &&
+                    now - debugLastProgressAt <= 1500) {
+                debugView.setVisibility(View.GONE);
+            }
+
             ui.postDelayed(this, 1000);
         }
     };
@@ -476,6 +493,7 @@ public class MainActivity extends Activity {
 
     private synchronized void handlePlaybackStall(String reason) {
         if (destroyed || channels.isEmpty() || playbackHealthy) return;
+        if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
         // 第一次卡住优先关闭硬解，用软件解码重试当前地址。
         if (!softwareFallbackUsed) {
@@ -500,6 +518,7 @@ public class MainActivity extends Activity {
     private void refreshSubscriptionAfterPlaybackFailure(String reason) {
         if (playbackRefreshInProgress || destroyed || channels.isEmpty()) return;
         playbackRefreshInProgress = true;
+        if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
         final Channel oldChannel = (current >= 0 && current < channels.size()) ? channels.get(current) : null;
         final int oldIndex = current;
@@ -570,6 +589,7 @@ public class MainActivity extends Activity {
         debugTimePos = -1;
         debugLastTimePos = -1;
         debugLastProgressAt = System.currentTimeMillis();
+        debugHealthySince = 0L;
         debugVideoCodec = "-";
         debugVideoFormat = "-";
         debugAudioCodec = "-";
@@ -844,6 +864,7 @@ public class MainActivity extends Activity {
         status.setText("正在播放：" + ch.name);
         status.setVisibility(View.VISIBLE);
         debugStage = "准备切换频道";
+        if (debugView != null) debugView.setVisibility(View.VISIBLE);
         resetAttemptTelemetry(true);
 
         playbackGeneration++;
@@ -978,8 +999,21 @@ public class MainActivity extends Activity {
         if (event.getAction() != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event);
         int code = event.getKeyCode();
 
+        // 返回键优先关闭频道列表；若频道列表没开，则优先隐藏直播调试窗口。
+        if (code == KeyEvent.KEYCODE_BACK) {
+            if (listVisible) {
+                hideList();
+                return true;
+            }
+            if (debugView != null && debugView.getVisibility() == View.VISIBLE) {
+                debugView.setVisibility(View.GONE);
+                return true;
+            }
+            return super.dispatchKeyEvent(event);
+        }
+
         if (listVisible) {
-            if (code == KeyEvent.KEYCODE_BACK || code == KeyEvent.KEYCODE_DPAD_LEFT) {
+            if (code == KeyEvent.KEYCODE_DPAD_LEFT) {
                 hideList();
                 return true;
             }
