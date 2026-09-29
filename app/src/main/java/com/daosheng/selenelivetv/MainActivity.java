@@ -29,6 +29,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 import java.io.IOException;
 import java.util.concurrent.ExecutorService;
@@ -62,6 +63,28 @@ public class MainActivity extends Activity {
     private ListView list;
     private TextView overlay;
     private TextView status;
+
+    // 直播调试状态层：用于定位网络、解复用、解码、缓存或画面输出卡点。
+    private TextView debugView;
+    private volatile String debugStage = "等待播放器";
+    private volatile boolean debugFileLoaded = false;
+    private volatile boolean debugVideoReady = false;
+    private volatile boolean debugAudioReady = false;
+    private volatile boolean debugPausedForCache = false;
+    private volatile boolean debugCoreIdle = true;
+    private volatile boolean debugEof = false;
+    private volatile double debugBufferPercent = -1;
+    private volatile double debugCacheSeconds = -1;
+    private volatile double debugTimePos = -1;
+    private volatile double debugLastTimePos = -1;
+    private volatile long debugLastProgressAt = 0L;
+    private volatile String debugVideoCodec = "-";
+    private volatile String debugVideoFormat = "-";
+    private volatile String debugAudioCodec = "-";
+    private volatile long debugWidth = 0;
+    private volatile long debugHeight = 0;
+    private volatile String debugLastEvent = "-";
+
     private int current = 0;
     private boolean listVisible = false;
 
