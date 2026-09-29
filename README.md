@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-- 版本：`1.4.7-android9-offline-cache`
+- 版本：`1.4.8-android9-bundled-fallback`
 - 默认订阅：`https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt`
 - 支持 Selene Base58 订阅：先解码 JSON，再读取 `lives.*.url` 对应的 M3U。
 - 播放核心：`dev.jdtech.mpv:libmpv:1.0.0`（libmpv + FFmpeg）。
@@ -80,3 +80,20 @@
 - 缓存超过 6 小时时，延迟约 15 秒后台静默刷新订阅；刷新失败不影响当前缓存播放。
 - 完全没有本地缓存时，才显示“本地没有频道缓存，正在首次加载直播订阅…”并联网获取。
 - 调试窗口把“订阅缓存”和“直播源服务器”分开显示，避免把订阅网络问题与直播源卡顿混在一起。
+
+
+## 首次安装无 VPN 兜底（1.4.8）
+
+频道来源现在按三层优先级读取：
+1. 应用内部文件缓存 `playlist_cache.m3u`
+2. SharedPreferences 备份
+3. APK 内置 `assets/fallback_live.m3u`
+
+只要任意一层能解析出频道，启动时就先显示频道并尝试播放，不等待 GitHub。
+
+订阅更新仍然使用原来的 Selene Base58 地址，但内部下载顺序对 GitHub Raw 做了优化：
+1. `cdn.jsdelivr.net/gh/...`
+2. `raw.githubusercontent.com/...`
+3. GitHub raw 备用入口
+
+这样不开 VPN 时更容易先拿到订阅，而直播频道播放仍直接访问频道自己的 URL，不经过订阅 CDN。
