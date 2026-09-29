@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-- 版本：`1.4.5-android9-mpv-autorecover`
+- 版本：`1.4.6-android9-mpv-debug-ui`
 - 默认订阅：`https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt`
 - 支持 Selene Base58 订阅：先解码 JSON，再读取 `lives.*.url` 对应的 M3U。
 - 播放核心：`dev.jdtech.mpv:libmpv:1.0.0`（libmpv + FFmpeg）。
@@ -62,3 +62,11 @@
 2. 软件解码仍失败，则后台重新下载 Selene 订阅和最新 `live.m3u`；
 3. 新订阅下载成功后写回本地缓存，优先按同名频道重新播放；
 4. 更新失败则保留原缓存，不清空频道列表。
+
+
+## 调试窗口交互（1.4.6）
+
+- 返回键：频道列表打开时先关闭频道列表；否则若直播调试窗口可见，则只隐藏调试窗口，不退出应用。
+- 切换频道：调试窗口重新显示。
+- 真正连续播放约 2 秒且播放进度持续增长后，调试窗口自动隐藏。
+- 若后续播放卡住并触发自动恢复，调试窗口会重新显示。
