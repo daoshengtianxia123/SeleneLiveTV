@@ -134,6 +134,17 @@ public class MainActivity extends Activity {
         overlayLp.topMargin = 30;
         root.addView(overlay, overlayLp);
 
+        debugView = new TextView(this);
+        debugView.setTextColor(0xFFFFFFFF);
+        debugView.setTextSize(14);
+        debugView.setPadding(16, 12, 16, 12);
+        debugView.setBackgroundColor(0xB0000000);
+        debugView.setText("调试：等待播放器");
+        FrameLayout.LayoutParams debugLp = new FrameLayout.LayoutParams(dp(430), -2, Gravity.TOP | Gravity.RIGHT);
+        debugLp.rightMargin = dp(18);
+        debugLp.topMargin = dp(18);
+        root.addView(debugView, debugLp);
+
         list = new ListView(this);
         list.setBackgroundColor(0xE6111111);
         list.setDividerHeight(1);
@@ -186,19 +197,69 @@ public class MainActivity extends Activity {
             mpvInitialized = true;
             player.addObserver(new MPVLib.EventObserver() {
                 @Override public void event(int eventId) {
+                    ui.post(() -> handleMpvEvent(eventId));
+                }
+
+                @Override public void eventProperty(String name) {
+                    ui.post(() -> updateDebugPanel());
+                }
+
+                @Override public void eventProperty(String name, boolean value) {
                     ui.post(() -> {
-                        if (eventId == 8 || eventId == 21) {
-                            playbackRetryCount = 0;
-                            status.setVisibility(View.GONE);
-                        }
+                        if ("paused-for-cache".equals(name)) debugPausedForCache = value;
+                        else if ("core-idle".equals(name)) debugCoreIdle = value;
+                        else if ("eof-reached".equals(name)) debugEof = value;
+                        updateDebugPanel();
                     });
                 }
-                @Override public void eventProperty(String name) {}
-                @Override public void eventProperty(String name, boolean value) {}
-                @Override public void eventProperty(String name, long value) {}
-                @Override public void eventProperty(String name, double value) {}
-                @Override public void eventProperty(String name, String value) {}
+
+                @Override public void eventProperty(String name, long value) {
+                    ui.post(() -> {
+                        if ("width".equals(name)) debugWidth = value;
+                        else if ("height".equals(name)) debugHeight = value;
+                        updateDebugPanel();
+                    });
+                }
+
+                @Override public void eventProperty(String name, double value) {
+                    ui.post(() -> {
+                        if ("cache-buffering-state".equals(name)) debugBufferPercent = value;
+                        else if ("demuxer-cache-duration".equals(name)) debugCacheSeconds = value;
+                        else if ("time-pos".equals(name)) {
+                            debugTimePos = value;
+                            if (debugLastTimePos < 0 || Math.abs(value - debugLastTimePos) >= 0.20) {
+                                debugLastTimePos = value;
+                                debugLastProgressAt = System.currentTimeMillis();
+                            }
+                        }
+                        updateDebugPanel();
+                    });
+                }
+
+                @Override public void eventProperty(String name, String value) {
+                    ui.post(() -> {
+                        if ("video-codec".equals(name)) debugVideoCodec = value == null ? "-" : value;
+                        else if ("video-format".equals(name)) debugVideoFormat = value == null ? "-" : value;
+                        else if ("audio-codec-name".equals(name)) debugAudioCodec = value == null ? "-" : value;
+                        updateDebugPanel();
+                    });
+                }
             });
+
+            player.observeProperty("paused-for-cache", MPVLib.MpvFormat.MPV_FORMAT_FLAG);
+            player.observeProperty("core-idle", MPVLib.MpvFormat.MPV_FORMAT_FLAG);
+            player.observeProperty("eof-reached", MPVLib.MpvFormat.MPV_FORMAT_FLAG);
+            player.observeProperty("cache-buffering-state", MPVLib.MpvFormat.MPV_FORMAT_DOUBLE);
+            player.observeProperty("demuxer-cache-duration", MPVLib.MpvFormat.MPV_FORMAT_DOUBLE);
+            player.observeProperty("time-pos", MPVLib.MpvFormat.MPV_FORMAT_DOUBLE);
+            player.observeProperty("video-codec", MPVLib.MpvFormat.MPV_FORMAT_STRING);
+            player.observeProperty("video-format", MPVLib.MpvFormat.MPV_FORMAT_STRING);
+            player.observeProperty("audio-codec-name", MPVLib.MpvFormat.MPV_FORMAT_STRING);
+            player.observeProperty("width", MPVLib.MpvFormat.MPV_FORMAT_INT64);
+            player.observeProperty("height", MPVLib.MpvFormat.MPV_FORMAT_INT64);
+
+            ui.removeCallbacks(debugWatchdog);
+            ui.post(debugWatchdog);
             if (pendingPlay || !channels.isEmpty()) {
                 pendingPlay = false;
                 queuePlayCurrent();
@@ -210,6 +271,123 @@ public class MainActivity extends Activity {
                     (e.getMessage() == null ? "" : "\n" + e.getMessage()));
         }
     }
+
+    private void handleMpvEvent(int eventId) {
+        debugLastEvent = mpvEventName(eventId);
+        switch (eventId) {
+            case 6: // START_FILE
+                debugStage = "1/4 正在打开直播流";
+                debugFileLoaded = false;
+                debugVideoReady = false;
+                debugAudioReady = false;
+                debugEof = false;
+                debugLastProgressAt = System.currentTimeMillis();
+                break;
+            case 8: // FILE_LOADED
+                debugStage = "2/4 已打开，正在识别音视频";
+                debugFileLoaded = true;
+                playbackRetryCount = 0;
+                break;
+            case 17: // VIDEO_RECONFIG
+                debugStage = "3/4 视频解码器已建立";
+                debugVideoReady = true;
+                break;
+            case 18: // AUDIO_RECONFIG
+                debugAudioReady = true;
+                break;
+            case 21: // PLAYBACK_RESTART
+                debugStage = "4/4 正在连续播放";
+                playbackRetryCount = 0;
+                status.setVisibility(View.GONE);
+                break;
+            case 7: // END_FILE
+                debugStage = "直播流已结束/断开";
+                break;
+            case 24: // QUEUE_OVERFLOW
+                debugStage = "MPV事件队列溢出";
+                break;
+            default:
+                break;
+        }
+        updateDebugPanel();
+    }
+
+    private String mpvEventName(int id) {
+        switch (id) {
+            case 1: return "SHUTDOWN";
+            case 5: return "COMMAND_REPLY";
+            case 6: return "START_FILE";
+            case 7: return "END_FILE";
+            case 8: return "FILE_LOADED";
+            case 17: return "VIDEO_RECONFIG";
+            case 18: return "AUDIO_RECONFIG";
+            case 20: return "SEEK";
+            case 21: return "PLAYBACK_RESTART";
+            case 22: return "PROPERTY_CHANGE";
+            case 24: return "QUEUE_OVERFLOW";
+            default: return "EVENT_" + id;
+        }
+    }
+
+    private String currentHost() {
+        if (channels.isEmpty() || current < 0 || current >= channels.size()) return "-";
+        try {
+            return new URL(channels.get(current).url).getHost();
+        } catch (Exception e) {
+            return "非HTTP流";
+        }
+    }
+
+    private String detectPlaybackProblem() {
+        long now = System.currentTimeMillis();
+
+        if (!surfaceReady) return "卡点：Surface 未就绪";
+        if (!mpvInitialized || player == null) return "卡点：MPV 未初始化";
+        if (!debugFileLoaded) return "卡点：直播地址尚未打开";
+        if (debugPausedForCache) return "卡点：网络缓冲中";
+        if (!debugVideoReady && debugFileLoaded) return "卡点：已打开流，等待视频解码";
+        if (debugEof) return "卡点：直播源已断开/结束";
+        if (debugCoreIdle && debugFileLoaded) return "卡点：MPV 当前空闲";
+        if (debugLastProgressAt > 0 && now - debugLastProgressAt > 3500) {
+            return "卡点：播放时间已停止 " + ((now - debugLastProgressAt) / 1000) + " 秒";
+        }
+        return "状态：数据持续播放";
+    }
+
+    private void updateDebugPanel() {
+        if (debugView == null) return;
+        String channelName = channels.isEmpty() || current < 0 || current >= channels.size()
+                ? "-" : channels.get(current).name;
+        String resolution = (debugWidth > 0 && debugHeight > 0)
+                ? debugWidth + "x" + debugHeight : "-";
+        String buffer = debugBufferPercent >= 0
+                ? String.format(Locale.US, "%.0f%%", debugBufferPercent) : "-";
+        String cache = debugCacheSeconds >= 0
+                ? String.format(Locale.US, "%.1fs", debugCacheSeconds) : "-";
+        String pos = debugTimePos >= 0
+                ? String.format(Locale.US, "%.1fs", debugTimePos) : "-";
+
+        debugView.setText(
+                "【直播调试】\n" +
+                "频道：" + channelName + "\n" +
+                "阶段：" + debugStage + "\n" +
+                "事件：" + debugLastEvent + "\n" +
+                "服务器：" + currentHost() + "\n" +
+                "缓存：" + buffer + "  已缓存：" + cache + "\n" +
+                "视频：" + debugVideoCodec + " / " + debugVideoFormat + " / " + resolution + "\n" +
+                "音频：" + debugAudioCodec + "\n" +
+                "时间：" + pos + "  cache=" + debugPausedForCache + "\n" +
+                detectPlaybackProblem()
+        );
+    }
+
+    private final Runnable debugWatchdog = new Runnable() {
+        @Override public void run() {
+            if (destroyed) return;
+            updateDebugPanel();
+            ui.postDelayed(this, 1000);
+        }
+    };
 
     private void statusTextSafe(String text) {
         if (status != null) { status.setText(text); status.setVisibility(View.VISIBLE); }
@@ -467,6 +645,26 @@ public class MainActivity extends Activity {
         ui.postDelayed(hideOverlay, 2500);
         status.setText("正在播放：" + ch.name);
         status.setVisibility(View.VISIBLE);
+        debugStage = "准备切换频道";
+        debugFileLoaded = false;
+        debugVideoReady = false;
+        debugAudioReady = false;
+        debugPausedForCache = false;
+        debugCoreIdle = false;
+        debugEof = false;
+        debugBufferPercent = -1;
+        debugCacheSeconds = -1;
+        debugTimePos = -1;
+        debugLastTimePos = -1;
+        debugLastProgressAt = System.currentTimeMillis();
+        debugVideoCodec = "-";
+        debugVideoFormat = "-";
+        debugAudioCodec = "-";
+        debugWidth = 0;
+        debugHeight = 0;
+        debugLastEvent = "-";
+        updateDebugPanel();
+
         playbackGeneration++;
         playbackRetryCount = 0;
 
@@ -489,6 +687,10 @@ public class MainActivity extends Activity {
         playerExecutor.execute(() -> {
             if (destroyed || token != playToken.get() || !surfaceReady || player == null || !mpvInitialized) return;
             try {
+                ui.post(() -> {
+                    debugStage = "已发送 loadfile，等待 START_FILE";
+                    updateDebugPanel();
+                });
                 player.command(new String[]{"loadfile", ch.url, "replace"});
                 player.setPropertyBoolean("pause", false);
                 ui.post(() -> {
