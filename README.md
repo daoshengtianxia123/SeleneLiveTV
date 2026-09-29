@@ -4,7 +4,7 @@
 
 ## 当前版本
 
-- 版本：`1.4.4-android9-mpv-diagnostics`
+- 版本：`1.4.5-android9-mpv-autorecover`
 - 默认订阅：`https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt`
 - 支持 Selene Base58 订阅：先解码 JSON，再读取 `lives.*.url` 对应的 M3U。
 - 播放核心：`dev.jdtech.mpv:libmpv:1.0.0`（libmpv + FFmpeg）。
@@ -44,3 +44,21 @@
 - PLAYBACK_RESTART：实际播放已经启动或缓冲后恢复
 - 缓存百分比、缓存秒数、视频/音频编码、分辨率、播放时间
 - 若播放时间连续约 3.5 秒不增长，会直接显示“播放时间已停止”
+
+
+## 自动恢复策略（1.4.5）
+
+启动时优先使用本地已解析的 `live.m3u` 缓存。若缓存频道能正常播放，不依赖网络更新订阅。
+
+当当前缓存频道出现以下异常时自动恢复：
+- 已经 FILE_LOADED 且识别到视频参数，但约 6 秒仍未真正开始播放；
+- 直播地址约 9 秒仍未打开；
+- 连续缓冲约 12 秒；
+- 播放过程中 time-pos 超过约 8 秒不增长；
+- 播放开始前收到 END_FILE。
+
+恢复顺序：
+1. 先把当前频道切到软件解码再试一次；
+2. 软件解码仍失败，则后台重新下载 Selene 订阅和最新 `live.m3u`；
+3. 新订阅下载成功后写回本地缓存，优先按同名频道重新播放；
+4. 更新失败则保留原缓存，不清空频道列表。
