@@ -1,0 +1,624 @@
+package com.daosheng.selenelivetv;
+
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.graphics.Color;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.View;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+
+import dev.jdtech.mpv.MPVLib;
+import android.widget.ArrayAdapter;
+import android.widget.FrameLayout;
+import android.widget.ListView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class MainActivity extends Activity {
+    public static final String DEFAULT_SUB_URL =
+            "https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt";
+    public static final String PREFS = "selene_live_prefs";
+    public static final String KEY_SUB_URL = "subscription_url";
+    private static final String KEY_CACHE = "playlist_cache";
+    private static final String KEY_CACHE_TIME = "playlist_cache_time";
+    private static final String KEY_LAST = "last_channel";
+    private static final long CACHE_REFRESH_INTERVAL_MS = 6L * 60L * 60L * 1000L;
+
+    private static final int REQ_SETTINGS = 1001;
+
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final List<Channel> channels = new ArrayList<>();
+    private SurfaceView playerView;
+    private MPVLib player;
+    private volatile boolean mpvInitialized = false;
+    private volatile boolean surfaceReady = false;
+    private volatile boolean destroyed = false;
+    private final ExecutorService playerExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicInteger playToken = new AtomicInteger(0);
+    private boolean pendingPlay = false;
+    private int playbackRetryCount = 0;
+    private int playbackGeneration = 0;
+    private ListView list;
+    private TextView overlay;
+    private TextView status;
+    private int current = 0;
+    private boolean listVisible = false;
+
+    @Override protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        getWindow().getDecorView().setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        buildUi();
+        loadInitial();
+    }
+
+    public static String getSubscriptionUrl(Context c) {
+        return c.getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(KEY_SUB_URL, DEFAULT_SUB_URL);
+    }
+
+    private void buildUi() {
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
+
+        playerView = new SurfaceView(this);
+        playerView.setFocusable(true);
+        root.addView(playerView, new FrameLayout.LayoutParams(-1, -1));
+        playerView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                surfaceReady = holder.getSurface() != null && holder.getSurface().isValid();
+                if (!surfaceReady || destroyed) return;
+                initMpvIfNeeded(holder);
+            }
+
+            @Override public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                surfaceReady = holder.getSurface() != null && holder.getSurface().isValid();
+                if (!surfaceReady || destroyed) return;
+                if (!mpvInitialized) {
+                    initMpvIfNeeded(holder);
+                } else if (player != null) {
+                    try { player.attachSurface(holder.getSurface()); } catch (Throwable e) {
+                        statusTextSafe("MPV Surface 绑定失败：" + e.getClass().getSimpleName());
+                    }
+                }
+            }
+
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {
+                surfaceReady = false;
+                if (player != null) {
+                    try { player.detachSurface(); } catch (Throwable ignored) {}
+                }
+            }
+        });
+
+        status = new TextView(this);
+        status.setTextColor(Color.WHITE);
+        status.setTextSize(22);
+        status.setPadding(24, 14, 24, 14);
+        status.setBackgroundColor(0x99000000);
+        status.setText("正在加载直播订阅…");
+        FrameLayout.LayoutParams statusLp = new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER);
+        root.addView(status, statusLp);
+
+        overlay = new TextView(this);
+        overlay.setTextColor(Color.WHITE);
+        overlay.setTextSize(22);
+        overlay.setPadding(22, 14, 22, 14);
+        overlay.setBackgroundColor(0x99000000);
+        overlay.setVisibility(View.GONE);
+        FrameLayout.LayoutParams overlayLp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.LEFT);
+        overlayLp.leftMargin = 30;
+        overlayLp.topMargin = 30;
+        root.addView(overlay, overlayLp);
+
+        list = new ListView(this);
+        list.setBackgroundColor(0xE6111111);
+        list.setDividerHeight(1);
+        list.setVisibility(View.GONE);
+        list.setFocusable(true);
+        FrameLayout.LayoutParams listLp = new FrameLayout.LayoutParams(dp(420), -1, Gravity.LEFT);
+        root.addView(list, listLp);
+
+        list.setOnItemClickListener((parent, view, position, id) -> {
+            current = position;
+            playCurrent();
+            hideList();
+        });
+
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        setContentView(root);
+    }
+
+    private synchronized void initMpvIfNeeded(SurfaceHolder holder) {
+        if (mpvInitialized || destroyed) {
+            if (mpvInitialized && player != null && holder != null && holder.getSurface() != null && holder.getSurface().isValid()) {
+                try { player.attachSurface(holder.getSurface()); } catch (Throwable ignored) {}
+            }
+            return;
+        }
+        try {
+            player = MPVLib.create(this);
+            player.setOptionString("vo", "gpu");
+            player.setOptionString("gpu-context", "android");
+            player.setOptionString("gpu-api", "opengl");
+            player.setOptionString("hwdec", "auto-safe");
+            player.setOptionString("hwdec-codecs", "all");
+            player.setOptionString("ao", "audiotrack");
+            player.setOptionString("cache", "yes");
+            player.setOptionString("cache-secs", "8");
+            player.setOptionString("demuxer-cache-time", "8");
+            player.setOptionString("demuxer-readahead-secs", "8");
+            player.setOptionString("demuxer-max-bytes", "64MiB");
+            player.setOptionString("demuxer-max-back-bytes", "8MiB");
+            player.setOptionString("network-timeout", "15");
+            player.setOptionString("user-agent", "AptvPlayer/1.4.10");
+            player.setOptionString("tls-verify", "no");
+            player.setOptionString("keep-open", "no");
+            player.setOptionString("force-window", "yes");
+            player.setOptionString("video-sync", "audio");
+            player.init();
+            if (holder != null && holder.getSurface() != null && holder.getSurface().isValid()) {
+                player.attachSurface(holder.getSurface());
+            }
+            mpvInitialized = true;
+            player.addObserver(new MPVLib.EventObserver() {
+                @Override public void event(int eventId) {
+                    ui.post(() -> {
+                        if (eventId == 8 || eventId == 21) {
+                            playbackRetryCount = 0;
+                            status.setVisibility(View.GONE);
+                        }
+                    });
+                }
+                @Override public void eventProperty(String name) {}
+                @Override public void eventProperty(String name, boolean value) {}
+                @Override public void eventProperty(String name, long value) {}
+                @Override public void eventProperty(String name, double value) {}
+                @Override public void eventProperty(String name, String value) {}
+            });
+            if (pendingPlay || !channels.isEmpty()) {
+                pendingPlay = false;
+                queuePlayCurrent();
+            }
+        } catch (Throwable e) {
+            mpvInitialized = false;
+            player = null;
+            statusTextSafe("MPV 初始化失败：" + e.getClass().getSimpleName() +
+                    (e.getMessage() == null ? "" : "\n" + e.getMessage()));
+        }
+    }
+
+    private void statusTextSafe(String text) {
+        if (status != null) { status.setText(text); status.setVisibility(View.VISIBLE); }
+    }
+
+    private int dp(int value) {
+        float d = getResources().getDisplayMetrics().density;
+        return Math.round(value * d);
+    }
+
+    private void loadInitial() {
+        SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String cache = p.getString(KEY_CACHE, "");
+        List<Channel> cached = PlaylistParser.parse(cache);
+        if (!cached.isEmpty()) {
+            setChannels(cached);
+            current = Math.min(p.getInt(KEY_LAST, 0), channels.size() - 1);
+            status.setVisibility(View.GONE);
+            playCurrent();
+
+            long cacheTime = p.getLong(KEY_CACHE_TIME, 0L);
+            if (System.currentTimeMillis() - cacheTime >= CACHE_REFRESH_INTERVAL_MS) {
+                ui.postDelayed(() -> refreshSubscription(false, true), 3000);
+            }
+        } else {
+            refreshSubscription(true, false);
+        }
+    }
+
+    private int findSameChannelIndex(List<Channel> items, Channel oldChannel, int fallback) {
+        if (items == null || items.isEmpty()) return 0;
+        if (oldChannel != null) {
+            for (int i = 0; i < items.size(); i++) {
+                Channel c = items.get(i);
+                if (c.url != null && c.url.equals(oldChannel.url)) return i;
+            }
+            for (int i = 0; i < items.size(); i++) {
+                Channel c = items.get(i);
+                if (c.name != null && c.name.equals(oldChannel.name)) return i;
+            }
+        }
+        return Math.max(0, Math.min(fallback, items.size() - 1));
+    }
+
+    private void refreshSubscription(boolean forceSettingsOnFail, boolean silentBackground) {
+        final String sub = getSubscriptionUrl(this);
+        final boolean hasUsableCache = !channels.isEmpty();
+        final Channel oldChannel = hasUsableCache && current >= 0 && current < channels.size()
+                ? channels.get(current) : null;
+        final int oldIndex = current;
+
+        if (!silentBackground || !hasUsableCache) {
+            status.setText("正在加载直播订阅…");
+            status.setVisibility(View.VISIBLE);
+        }
+
+        new Thread(() -> {
+            try {
+                ResolvedPlaylist resolved = resolveSubscription(sub);
+                if (resolved.channels.isEmpty()) {
+                    throw new IllegalStateException("直播列表中没有有效频道");
+                }
+
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putString(KEY_CACHE, resolved.playlistText)
+                        .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
+                        .apply();
+
+                ui.post(() -> {
+                    Channel playingNow = !channels.isEmpty() && current >= 0 && current < channels.size()
+                            ? channels.get(current) : oldChannel;
+                    int currentNow = current;
+                    int newIndex = findSameChannelIndex(resolved.channels, playingNow,
+                            currentNow >= 0 ? currentNow : oldIndex);
+                    setChannels(resolved.channels);
+                    current = newIndex;
+
+                    if (silentBackground && hasUsableCache) {
+                        return;
+                    }
+
+                    status.setText("订阅加载成功，共 " + channels.size() + " 个频道");
+                    status.setVisibility(View.VISIBLE);
+                    ui.postDelayed(() -> {
+                        if (!channels.isEmpty()) status.setVisibility(View.GONE);
+                    }, 1200);
+                    playCurrent();
+                });
+            } catch (Exception e) {
+                final String reason = friendlyError(e);
+                ui.post(() -> {
+                    if (channels.isEmpty()) {
+                        status.setText("订阅加载失败\n" + reason + "\n\n按菜单键进入订阅设置");
+                        status.setVisibility(View.VISIBLE);
+                        if (forceSettingsOnFail) ui.postDelayed(this::openSettings, 1200);
+                    } else if (!silentBackground) {
+                        Toast.makeText(this, "订阅更新失败：" + reason + "，继续使用本地缓存", Toast.LENGTH_LONG).show();
+                    }
+                });
+            }
+        }, "subscription-loader").start();
+    }
+
+    private ResolvedPlaylist resolveSubscription(String subscriptionUrl) throws Exception {
+        String first = downloadWithFallback(subscriptionUrl);
+
+        List<Channel> direct = PlaylistParser.parse(first);
+        if (!direct.isEmpty()) {
+            return new ResolvedPlaylist(first, direct);
+        }
+
+        List<String> liveUrls;
+        try {
+            liveUrls = SeleneSubscriptionParser.extractLiveUrls(first);
+        } catch (Exception decodeError) {
+            throw new IllegalStateException("既不是有效 M3U，也无法按 Selene Base58 订阅解析：" + decodeError.getMessage(), decodeError);
+        }
+
+        StringBuilder errors = new StringBuilder();
+        for (String liveUrl : liveUrls) {
+            try {
+                String playlist = downloadWithFallback(liveUrl);
+                List<Channel> parsed = PlaylistParser.parse(playlist);
+                if (!parsed.isEmpty()) {
+                    return new ResolvedPlaylist(playlist, parsed);
+                }
+                if (errors.length() > 0) errors.append("；");
+                errors.append("列表为空: ").append(liveUrl);
+            } catch (Exception e) {
+                if (errors.length() > 0) errors.append("；");
+                errors.append(e.getMessage());
+            }
+        }
+        throw new IllegalStateException("Selene订阅已解码，但直播列表加载失败：" + errors);
+    }
+
+    private static final class ResolvedPlaylist {
+        final String playlistText;
+        final List<Channel> channels;
+
+        ResolvedPlaylist(String playlistText, List<Channel> channels) {
+            this.playlistText = playlistText;
+            this.channels = channels;
+        }
+    }
+
+    private String friendlyError(Exception e) {
+        String msg = e.getMessage();
+        if (msg == null || msg.trim().isEmpty()) msg = e.getClass().getSimpleName();
+        if (e instanceof java.net.SocketTimeoutException) return "网络连接超时";
+        if (e instanceof java.net.UnknownHostException) return "无法解析服务器地址，请检查网络/DNS";
+        if (e instanceof javax.net.ssl.SSLException) return "HTTPS/SSL 连接失败";
+        return msg;
+    }
+
+    private String downloadWithFallback(String address) throws Exception {
+        List<String> candidates = buildFallbackUrls(address);
+        Exception last = null;
+        StringBuilder tried = new StringBuilder();
+
+        for (String candidate : candidates) {
+            try {
+                return download(candidate);
+            } catch (Exception e) {
+                last = e;
+                if (tried.length() > 0) tried.append("；");
+                tried.append(shortHost(candidate)).append(": ").append(simpleNetworkError(e));
+            }
+        }
+
+        if (last instanceof java.net.UnknownHostException) {
+            throw new java.net.UnknownHostException("所有订阅入口均无法解析：" + tried);
+        }
+        throw new IOException("所有订阅入口均加载失败：" + tried, last);
+    }
+
+    private List<String> buildFallbackUrls(String address) {
+        List<String> urls = new ArrayList<>();
+        addUnique(urls, address);
+        try {
+            URL u = new URL(address);
+            if ("raw.githubusercontent.com".equalsIgnoreCase(u.getHost())) {
+                String[] parts = u.getPath().split("/", 5);
+                if (parts.length >= 5) {
+                    String owner = parts[1];
+                    String repo = parts[2];
+                    String branch = parts[3];
+                    String path = parts[4];
+                    addUnique(urls, "https://cdn.jsdelivr.net/gh/" + owner + "/" + repo + "@" + branch + "/" + path);
+                    addUnique(urls, "https://github.com/" + owner + "/" + repo + "/raw/refs/heads/" + branch + "/" + path);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return urls;
+    }
+
+    private void addUnique(List<String> urls, String value) {
+        if (value != null && !value.trim().isEmpty() && !urls.contains(value)) urls.add(value);
+    }
+
+    private String shortHost(String address) {
+        try { return new URL(address).getHost(); }
+        catch (Exception e) { return address; }
+    }
+
+    private String simpleNetworkError(Exception e) {
+        if (e instanceof java.net.UnknownHostException) return "DNS失败";
+        if (e instanceof java.net.SocketTimeoutException) return "超时";
+        if (e instanceof javax.net.ssl.SSLException) return "SSL失败";
+        String m = e.getMessage();
+        return (m == null || m.trim().isEmpty()) ? e.getClass().getSimpleName() : m;
+    }
+
+    private String download(String address) throws Exception {
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL(address).openConnection();
+            c.setConnectTimeout(10000);
+            c.setReadTimeout(15000);
+            c.setRequestProperty("User-Agent", "SeleneLiveTV/1.4 AndroidTV");
+            c.setRequestProperty("Accept", "*/*");
+            c.setInstanceFollowRedirects(true);
+            int code = c.getResponseCode();
+            if (code < 200 || code >= 300) {
+                throw new IOException("HTTP " + code + "：" + address);
+            }
+            try (InputStream in = c.getInputStream();
+                 BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = r.readLine()) != null) sb.append(line).append('\n');
+                return sb.toString();
+            }
+        } finally {
+            if (c != null) c.disconnect();
+        }
+    }
+
+    private void setChannels(List<Channel> items) {
+        channels.clear();
+        channels.addAll(items);
+        list.setAdapter(new ArrayAdapter<Channel>(this, android.R.layout.simple_list_item_1, channels));
+    }
+
+    private void playCurrent() {
+        if (channels.isEmpty()) return;
+        if (current < 0) current = channels.size() - 1;
+        if (current >= channels.size()) current = 0;
+        Channel ch = channels.get(current);
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_LAST, current).apply();
+        overlay.setText((current + 1) + "  " + ch.name + (ch.group.isEmpty() ? "" : "\n" + ch.group));
+        overlay.setVisibility(View.VISIBLE);
+        ui.removeCallbacks(hideOverlay);
+        ui.postDelayed(hideOverlay, 2500);
+        status.setText("正在播放：" + ch.name);
+        status.setVisibility(View.VISIBLE);
+        playbackGeneration++;
+        playbackRetryCount = 0;
+
+        if (!surfaceReady || !mpvInitialized || player == null) {
+            pendingPlay = true;
+            status.setText("正在准备播放器：" + ch.name);
+            status.setVisibility(View.VISIBLE);
+            return;
+        }
+        queuePlayCurrent();
+    }
+
+    private void queuePlayCurrent() {
+        if (channels.isEmpty() || destroyed) return;
+        final int index = current;
+        final Channel ch = channels.get(index);
+        final int token = playToken.incrementAndGet();
+        pendingPlay = false;
+
+        playerExecutor.execute(() -> {
+            if (destroyed || token != playToken.get() || !surfaceReady || player == null || !mpvInitialized) return;
+            try {
+                player.command(new String[]{"loadfile", ch.url, "replace"});
+                player.setPropertyBoolean("pause", false);
+                ui.post(() -> {
+                    if (!destroyed && token == playToken.get()) {
+                        playerView.requestFocus();
+                    }
+                });
+            } catch (Throwable e) {
+                ui.post(() -> {
+                    if (!destroyed && token == playToken.get()) {
+                        statusTextSafe("MPV 播放失败：" + e.getClass().getSimpleName() +
+                                (e.getMessage() == null ? "" : "\n" + e.getMessage()));
+                    }
+                });
+            }
+        });
+    }
+
+    private void schedulePlaybackRetry(String reason) {
+        if (channels.isEmpty()) return;
+        final int generation = playbackGeneration;
+        if (playbackRetryCount >= 2) {
+            status.setText(reason + "\n当前频道播放失败，按 ↑ / ↓ 切换频道");
+            status.setVisibility(View.VISIBLE);
+            return;
+        }
+        playbackRetryCount++;
+        status.setText(reason + "\n正在自动重试 " + playbackRetryCount + "/2…");
+        status.setVisibility(View.VISIBLE);
+        ui.postDelayed(() -> {
+            if (generation != playbackGeneration || channels.isEmpty() || player == null) return;
+            queuePlayCurrent();
+        }, 1500);
+    }
+
+    private final Runnable hideOverlay = () -> overlay.setVisibility(View.GONE);
+
+    private void previousChannel() {
+        if (channels.isEmpty()) return;
+        current--;
+        if (current < 0) current = channels.size() - 1;
+        playCurrent();
+    }
+
+    private void nextChannel() {
+        if (channels.isEmpty()) return;
+        current++;
+        if (current >= channels.size()) current = 0;
+        playCurrent();
+    }
+
+    private void showList() {
+        if (channels.isEmpty()) return;
+        listVisible = true;
+        list.setVisibility(View.VISIBLE);
+        list.setSelection(current);
+        list.requestFocus();
+    }
+
+    private void hideList() {
+        listVisible = false;
+        list.setVisibility(View.GONE);
+        playerView.requestFocus();
+    }
+
+    private void openSettings() {
+        startActivityForResult(new Intent(this, SettingsActivity.class), REQ_SETTINGS);
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_SETTINGS) {
+            status.setText("正在重新加载订阅…");
+            status.setVisibility(View.VISIBLE);
+            refreshSubscription(true, false);
+        }
+    }
+
+    @Override protected void onDestroy() {
+        destroyed = true;
+        playToken.incrementAndGet();
+        ui.removeCallbacksAndMessages(null);
+        final MPVLib oldPlayer = player;
+        player = null;
+        mpvInitialized = false;
+        surfaceReady = false;
+        if (oldPlayer != null) {
+            try { oldPlayer.detachSurface(); } catch (Throwable ignored) {}
+            try { oldPlayer.command(new String[]{"stop"}); } catch (Throwable ignored) {}
+            try { oldPlayer.destroy(); } catch (Throwable ignored) {}
+        }
+        playerExecutor.shutdownNow();
+        super.onDestroy();
+    }
+
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getAction() != KeyEvent.ACTION_DOWN) return super.dispatchKeyEvent(event);
+        int code = event.getKeyCode();
+
+        if (listVisible) {
+            if (code == KeyEvent.KEYCODE_BACK || code == KeyEvent.KEYCODE_DPAD_LEFT) {
+                hideList();
+                return true;
+            }
+            return super.dispatchKeyEvent(event);
+        }
+
+        switch (code) {
+            case KeyEvent.KEYCODE_DPAD_UP:
+            case KeyEvent.KEYCODE_CHANNEL_UP:
+            case KeyEvent.KEYCODE_PAGE_UP:
+            case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+                previousChannel();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+            case KeyEvent.KEYCODE_CHANNEL_DOWN:
+            case KeyEvent.KEYCODE_PAGE_DOWN:
+            case KeyEvent.KEYCODE_MEDIA_NEXT:
+                nextChannel();
+                return true;
+            case KeyEvent.KEYCODE_DPAD_CENTER:
+            case KeyEvent.KEYCODE_ENTER:
+                showList();
+                return true;
+            case KeyEvent.KEYCODE_MENU:
+            case KeyEvent.KEYCODE_SETTINGS:
+                openSettings();
+                return true;
+            default:
+                return super.dispatchKeyEvent(event);
+        }
+    }
+}
