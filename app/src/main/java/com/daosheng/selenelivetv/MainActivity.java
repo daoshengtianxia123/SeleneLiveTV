@@ -98,6 +98,7 @@ public class MainActivity extends Activity {
     private volatile boolean playbackRefreshInProgress = false;
     private volatile boolean playbackRefreshTried = false;
     private volatile long channelAttemptStartedAt = 0L;
+    private volatile String playlistSource = "未加载";
 
     private int current = 0;
     private boolean listVisible = false;
@@ -426,7 +427,7 @@ public class MainActivity extends Activity {
                 "【直播调试】\n" +
                 "频道：" + channelName + "\n" +
                 "阶段：" + debugStage + "\n" +
-                "订阅：本地缓存优先 / 后台更新\n" +
+                "订阅：" + playlistSource + "\n" +
                 "事件：" + debugLastEvent + "\n" +
                 "直播源：" + currentHost() + "\n" +
                 "缓存：" + buffer + "  已缓存：" + cache + "\n" +
@@ -549,6 +550,7 @@ public class MainActivity extends Activity {
                     int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
                     setChannels(resolved.channels);
                     current = newIndex;
+                    playlistSource = "网络更新成功";
                     playbackRefreshInProgress = false;
                     playbackRefreshTried = true;
 
@@ -625,35 +627,73 @@ public class MainActivity extends Activity {
     private void loadInitial() {
         SharedPreferences p = getSharedPreferences(PREFS, MODE_PRIVATE);
 
-        // 1) 优先读内部文件缓存；2) 文件没有再回退到 SharedPreferences。
-        // 只要之前成功加载过一次，启动时就绝不先等网络。
+        // 第一层：应用内部文件缓存。只要之前成功更新过一次，就优先从这里启动。
         String cache = readPlaylistCacheFromDisk();
-        if (cache.trim().isEmpty()) {
-            cache = p.getString(KEY_CACHE, "");
-        }
-
         List<Channel> cached = PlaylistParser.parse(cache);
         if (!cached.isEmpty()) {
-            setChannels(cached);
-            current = Math.min(p.getInt(KEY_LAST, 0), channels.size() - 1);
-            status.setText("正在使用本地频道缓存");
-            status.setVisibility(View.VISIBLE);
-
-            // 先播放缓存，网络更新不能阻塞启动。
-            playCurrent();
-
-            long cacheTime = p.getLong(KEY_CACHE_TIME, 0L);
-            if (System.currentTimeMillis() - cacheTime >= CACHE_REFRESH_INTERVAL_MS) {
-                // 给播放器一点启动时间，后台静默刷新。
-                ui.postDelayed(() -> refreshSubscription(false, true), 15000);
-            }
+            playlistSource = "内部文件缓存";
+            startFromLocalPlaylist(p, cached, false);
             return;
         }
 
-        // 完全没有任何本地缓存时，才联网获取订阅。
-        status.setText("本地没有频道缓存，正在首次加载直播订阅…");
+        // 第二层：SharedPreferences 备份。
+        cache = p.getString(KEY_CACHE, "");
+        cached = PlaylistParser.parse(cache);
+        if (!cached.isEmpty()) {
+            playlistSource = "Preferences备份";
+            // 补写回内部文件，后续启动更稳。
+            writePlaylistCacheToDisk(cache);
+            startFromLocalPlaylist(p, cached, false);
+            return;
+        }
+
+        // 第三层：APK 自带最近一次可用直播列表。
+        // 第一次安装、GitHub无法访问、没开VPN时也能先显示频道并尝试直连播放。
+        String bundled = readBundledPlaylist();
+        List<Channel> bundledChannels = PlaylistParser.parse(bundled);
+        if (!bundledChannels.isEmpty()) {
+            playlistSource = "APK内置备用列表";
+            writePlaylistCacheToDisk(bundled);
+            p.edit().putString(KEY_CACHE, bundled).commit();
+            startFromLocalPlaylist(p, bundledChannels, true);
+            return;
+        }
+
+        // 三层本地数据都没有时才阻塞式联网获取。
+        playlistSource = "首次网络加载";
+        status.setText("本地没有任何频道列表，正在首次加载直播订阅…");
         status.setVisibility(View.VISIBLE);
         refreshSubscription(true, false);
+    }
+
+    private void startFromLocalPlaylist(SharedPreferences p, List<Channel> localChannels, boolean fromBundled) {
+        setChannels(localChannels);
+        current = Math.min(p.getInt(KEY_LAST, 0), channels.size() - 1);
+        status.setText(fromBundled ? "正在使用APK内置频道列表" : "正在使用本地频道缓存");
+        status.setVisibility(View.VISIBLE);
+
+        // 本地列表先播，订阅网络绝不阻塞开机。
+        playCurrent();
+
+        long cacheTime = p.getLong(KEY_CACHE_TIME, 0L);
+        boolean stale = cacheTime <= 0L || System.currentTimeMillis() - cacheTime >= CACHE_REFRESH_INTERVAL_MS;
+
+        // 内置列表属于兜底，稍后静默尝试更新；普通缓存只有过期后才更新。
+        if (fromBundled || stale) {
+            ui.postDelayed(() -> refreshSubscription(false, true), 15000);
+        }
+    }
+
+    private String readBundledPlaylist() {
+        try (InputStream in = getAssets().open("fallback_live.m3u");
+             BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = r.readLine()) != null) sb.append(line).append('\n');
+            return sb.toString();
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private String readPlaylistCacheFromDisk() {
@@ -857,7 +897,6 @@ public class MainActivity extends Activity {
 
     private List<String> buildFallbackUrls(String address) {
         List<String> urls = new ArrayList<>();
-        addUnique(urls, address);
         try {
             URL u = new URL(address);
             if ("raw.githubusercontent.com".equalsIgnoreCase(u.getHost())) {
@@ -867,12 +906,18 @@ public class MainActivity extends Activity {
                     String repo = parts[2];
                     String branch = parts[3];
                     String path = parts[4];
+
+                    // TV 不开 VPN 时优先试 CDN，避免 raw.githubusercontent.com DNS/路由问题。
                     addUnique(urls, "https://cdn.jsdelivr.net/gh/" + owner + "/" + repo + "@" + branch + "/" + path);
+                    addUnique(urls, address);
                     addUnique(urls, "https://github.com/" + owner + "/" + repo + "/raw/refs/heads/" + branch + "/" + path);
+                    return urls;
                 }
             }
         } catch (Exception ignored) {
         }
+
+        addUnique(urls, address);
         return urls;
     }
 
