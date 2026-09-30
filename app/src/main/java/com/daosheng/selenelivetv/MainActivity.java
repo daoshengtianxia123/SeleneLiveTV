@@ -67,6 +67,8 @@ public class MainActivity extends Activity {
     private final AtomicInteger playToken = new AtomicInteger(0);
     private boolean pendingPlay = false;
     private int playbackRetryCount = 0;
+    // 阶段1/2属于直播源/网络建立阶段，单独允许一次“干净重连”，不要误切软件解码。
+    private int streamReconnectCount = 0;
     private int playbackGeneration = 0;
     private ListView list;
     private TextView overlay;
@@ -227,12 +229,14 @@ public class MainActivity extends Activity {
             player.setOptionString("hwdec-codecs", "all");
             player.setOptionString("ao", "audiotrack");
             player.setOptionString("cache", "yes");
-            player.setOptionString("cache-secs", "8");
-            player.setOptionString("demuxer-cache-time", "8");
-            player.setOptionString("demuxer-readahead-secs", "8");
-            player.setOptionString("demuxer-max-bytes", "64MiB");
-            player.setOptionString("demuxer-max-back-bytes", "8MiB");
-            player.setOptionString("network-timeout", "15");
+            // 国内 IPTV 直播优先快速起播，避免大缓存把阶段2拖很久。
+            player.setOptionString("cache-secs", "3");
+            player.setOptionString("demuxer-cache-time", "3");
+            player.setOptionString("demuxer-readahead-secs", "3");
+            player.setOptionString("demuxer-max-bytes", "32MiB");
+            player.setOptionString("demuxer-max-back-bytes", "4MiB");
+            player.setOptionString("cache-pause-initial", "no");
+            player.setOptionString("network-timeout", "10");
             player.setOptionString("user-agent", "AptvPlayer/1.4.10");
             player.setOptionString("tls-verify", "no");
             player.setOptionString("keep-open", "no");
@@ -342,7 +346,6 @@ public class MainActivity extends Activity {
             case 8: // FILE_LOADED
                 debugStage = "2/4 已打开，正在识别音视频";
                 debugFileLoaded = true;
-                playbackRetryCount = 0;
                 break;
             case 17: // VIDEO_RECONFIG
                 debugStage = "3/4 视频解码器已建立";
@@ -445,7 +448,8 @@ public class MainActivity extends Activity {
                 "音频：" + debugAudioCodec + "\n" +
                 "时间：" + pos + "  cache=" + debugPausedForCache + "\n" +
                 "恢复：" + (playbackRefreshInProgress ? "正在更新订阅" :
-                        (softwareFallbackUsed ? "已尝试软件解码" : "未触发")) + "\n" +
+                        (softwareFallbackUsed ? "已尝试软件解码" :
+                                (streamReconnectCount > 0 ? "已重连直播源" : "未触发"))) + "\n" +
                 detectPlaybackProblem()
         );
     }
@@ -480,13 +484,11 @@ public class MainActivity extends Activity {
         if (playbackHealthy) {
             long noProgressMs = debugLastProgressAt > 0 ? now - debugLastProgressAt : 0;
 
-            // 正常播放后又进入长期缓冲，也必须自动恢复，不能永久卡住。
-            if (debugPausedForCache && noProgressMs >= 12000) {
-                handlePlaybackStall("播放中连续缓冲超过12秒");
+            if (debugPausedForCache && noProgressMs >= 10000) {
+                handlePlaybackStall("播放中连续缓冲超过10秒");
                 return;
             }
 
-            // 已经播放过，但时间轴超过8秒不增长。
             if (!debugPausedForCache && noProgressMs >= 8000) {
                 handlePlaybackStall("播放时间超过8秒没有增长");
             }
@@ -496,16 +498,22 @@ public class MainActivity extends Activity {
         long elapsed = now - channelAttemptStartedAt;
         if (channelAttemptStartedAt <= 0) return;
 
-        // 阶段1：连 FILE_LOADED 都没有。
-        if (!debugFileLoaded && elapsed >= 9000) {
-            handlePlaybackStall("阶段1/4：直播地址9秒仍未打开");
+        // 阶段1：还没有 FILE_LOADED，本质是连接直播服务器/打开URL问题。
+        if (!debugFileLoaded && elapsed >= 8000) {
+            handlePlaybackStall("阶段1/4：直播地址8秒仍未打开");
             return;
         }
 
-        // 阶段2：已经 FILE_LOADED，但一直没有真正开始播放。
-        // 不再要求先拿到 width/height，否则部分异常流会永远停在2/4。
-        if (debugFileLoaded && debugTimePos <= 0.05 && elapsed >= 10000) {
-            handlePlaybackStall("阶段2/4：直播流已打开但10秒仍未开始播放");
+        // 阶段2：已经打开容器，但视频解码器还没有真正建立。
+        // 国内运营商 TS/HLS 某些源会偶发关键帧/首包慢，给到12秒，再做“网络流重连”。
+        if (debugFileLoaded && !debugVideoReady && elapsed >= 12000) {
+            handlePlaybackStall("阶段2/4：直播流已打开但12秒仍未建立视频");
+            return;
+        }
+
+        // 阶段3：视频解码器已经建立，但仍然没有时间轴推进，这时才值得尝试软件解码。
+        if (debugVideoReady && debugTimePos <= 0.05 && elapsed >= 8000) {
+            handlePlaybackStall("阶段3/4：视频解码已建立但8秒仍未开始播放");
             return;
         }
 
@@ -517,15 +525,30 @@ public class MainActivity extends Activity {
     private synchronized void handlePlaybackStall(String reason) {
         if (destroyed || channels.isEmpty()) return;
 
-        // 即使之前已经正常播放过，后续真正卡死也要进入恢复流程。
+        boolean hadBeenHealthy = playbackHealthy;
         if (playbackHealthy) {
             playbackHealthy = false;
             debugHealthySince = 0L;
         }
         if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
-        // 第一次卡住优先关闭硬解，用软件解码重试当前地址。
-        if (!softwareFallbackUsed) {
+        // 阶段1/2：还没真正建立视频解码，不要误判成硬解问题。
+        // 先彻底停止当前流，再用相同URL干净重连一次。
+        if (!debugVideoReady && !hadBeenHealthy && streamReconnectCount < 1) {
+            streamReconnectCount++;
+            forceSoftwareDecode = false;
+            debugStage = "自动恢复：直播源干净重连 " + streamReconnectCount + "/1";
+            status.setText(reason + "\n正在重新连接当前直播源…");
+            status.setVisibility(View.VISIBLE);
+            updateDebugPanel();
+            resetAttemptTelemetry(false);
+            queueCleanReconnectCurrent();
+            return;
+        }
+
+        // 已经建立过视频解码器，或者正常播放后又卡死：
+        // 这时才尝试关闭硬解，验证是否为硬件解码兼容问题。
+        if ((debugVideoReady || hadBeenHealthy) && !softwareFallbackUsed) {
             softwareFallbackUsed = true;
             forceSoftwareDecode = true;
             debugStage = "自动恢复：切换软件解码重试";
@@ -533,12 +556,11 @@ public class MainActivity extends Activity {
             status.setVisibility(View.VISIBLE);
             updateDebugPanel();
             resetAttemptTelemetry(false);
-            queuePlayCurrent();
+            queueCleanReconnectCurrent();
             return;
         }
 
-        // 软件解码仍然失败：后台刷新一次订阅。
-        // 为避免连续坏台时每个频道都请求 Gitee，播放故障触发的订阅刷新至少间隔60秒。
+        // 同一URL重连/软件解码都无效，再更新频道列表。
         if (!playbackRefreshTried && !playbackRefreshInProgress) {
             long now = System.currentTimeMillis();
             if (now - lastPlaybackTriggeredRefreshAt >= 60000L) {
@@ -551,7 +573,7 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 当前频道软件解码 + 订阅刷新都试过仍失败，无人值守场景自动换下一个频道。
+        // 已经刷新过订阅，或者60秒内刚刷新过，仍然失败时直接自动换台。
         if (playbackRefreshTried && !playbackRefreshInProgress) {
             debugStage = "自动恢复失败，准备切换下一个频道";
             status.setText(reason + "\n正在自动切换下一个频道…");
@@ -559,6 +581,44 @@ public class MainActivity extends Activity {
             updateDebugPanel();
             scheduleAutoNextChannel();
         }
+    }
+
+    private void queueCleanReconnectCurrent() {
+        if (channels.isEmpty() || destroyed) return;
+        final int token = playToken.incrementAndGet();
+        final Channel ch = channels.get(current);
+        pendingPlay = false;
+
+        playerExecutor.execute(() -> {
+            if (destroyed || token != playToken.get() || player == null || !mpvInitialized) return;
+            try {
+                // 先 stop，释放上一个卡住的 demux/decoder 状态；短暂停顿后重新 loadfile。
+                try { player.command(new String[]{"stop"}); } catch (Throwable ignored) {}
+                try { Thread.sleep(180); } catch (InterruptedException ignored) {}
+
+                try {
+                    player.setPropertyString("hwdec", forceSoftwareDecode ? "no" : "auto-safe");
+                } catch (Throwable ignored) {}
+
+                ui.post(() -> {
+                    debugStage = forceSoftwareDecode
+                            ? "重新连接（软件解码），等待 START_FILE"
+                            : "重新连接直播源，等待 START_FILE";
+                    updateDebugPanel();
+                });
+
+                player.command(new String[]{"loadfile", ch.url, "replace"});
+                player.setPropertyBoolean("pause", false);
+            } catch (Throwable e) {
+                ui.post(() -> {
+                    if (!destroyed && token == playToken.get()) {
+                        debugStage = "直播源重连命令失败";
+                        statusTextSafe("直播源重连失败：" + e.getClass().getSimpleName());
+                        updateDebugPanel();
+                    }
+                });
+            }
+        });
     }
 
     private void refreshSubscriptionAfterPlaybackFailure(String reason) {
@@ -599,6 +659,7 @@ public class MainActivity extends Activity {
                     // 新地址重新从自动/硬解开始，不沿用前一次软件解码状态。
                     forceSoftwareDecode = false;
                     softwareFallbackUsed = false;
+                    streamReconnectCount = 0;
                     playbackHealthy = false;
                     debugStage = "订阅更新成功，正在用新地址重播";
                     status.setText("订阅已更新，正在重新播放：" +
@@ -1094,6 +1155,7 @@ public class MainActivity extends Activity {
 
         playbackGeneration++;
         playbackRetryCount = 0;
+        streamReconnectCount = 0;
 
         if (!surfaceReady || !mpvInitialized || player == null) {
             pendingPlay = true;
