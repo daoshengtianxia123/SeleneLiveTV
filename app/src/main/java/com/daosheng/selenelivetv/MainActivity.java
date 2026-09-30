@@ -739,7 +739,7 @@ public class MainActivity extends Activity {
                     }
 
                     int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
-                    stagePendingCache(resolved);
+                    stagePendingCache(resolved, true);
                     setChannels(resolved.channels);
                     current = newIndex;
                     playlistSource = "Gitee候选列表（等待播放验证）";
@@ -845,11 +845,12 @@ public class MainActivity extends Activity {
         updateDebugPanel();
     }
 
-    private void stagePendingCache(ResolvedPlaylist resolved) {
+    private void stagePendingCache(ResolvedPlaylist resolved, boolean candidateIsActuallyPlaying) {
         if (resolved == null || resolved.channels == null || resolved.channels.isEmpty()) return;
         pendingSubscriptionText = resolved.subscriptionText;
         pendingPlaylistText = resolved.playlistText;
-        pendingCachePromotion = true;
+        // 只有当前真正切换到这份候选列表播放时，才允许“连续播放2秒”晋升正式缓存。
+        pendingCachePromotion = candidateIsActuallyPlaying;
     }
 
     private void clearPendingCache() {
@@ -1062,7 +1063,7 @@ public class MainActivity extends Activity {
                     // 已有能用的本地缓存时，后台更新只保存为候选，不立刻覆盖“好缓存”。
                     // 这样即使 Gitee 新列表里某些源在本地网络不可用，下次开机仍使用已验证列表。
                     if (hasUsableCache) {
-                        stagePendingCache(resolved);
+                        stagePendingCache(resolved, false);
                         playlistSource = "已验证本地缓存（后台更新待验证）";
                         if (!silentBackground) {
                             Toast.makeText(this, "订阅已更新，待当前网络验证后再替换缓存",
@@ -1073,7 +1074,7 @@ public class MainActivity extends Activity {
                     }
 
                     // 完全没有可用列表时才直接使用网络列表，并等真正播放成功后再晋升缓存。
-                    stagePendingCache(resolved);
+                    stagePendingCache(resolved, true);
                     int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
                     setChannels(resolved.channels);
                     current = newIndex;
