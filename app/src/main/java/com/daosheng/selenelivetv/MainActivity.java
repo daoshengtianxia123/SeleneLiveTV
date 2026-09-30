@@ -45,8 +45,10 @@ public class MainActivity extends Activity {
     public static final String PREFS = "selene_live_prefs";
     public static final String KEY_SUB_URL = "subscription_url";
     private static final String KEY_CACHE = "playlist_cache";
+    private static final String KEY_SUB_CACHE = "subscription_cache";
     private static final String KEY_CACHE_TIME = "playlist_cache_time";
     private static final String CACHE_FILE_NAME = "playlist_cache.m3u";
+    private static final String SUB_CACHE_FILE_NAME = "selene-sub-cache.txt";
     private static final String KEY_LAST = "last_channel";
     private static final long CACHE_REFRESH_INTERVAL_MS = 6L * 60L * 60L * 1000L;
 
@@ -97,6 +99,7 @@ public class MainActivity extends Activity {
     private volatile boolean forceSoftwareDecode = false;
     private volatile boolean playbackRefreshInProgress = false;
     private volatile boolean playbackRefreshTried = false;
+    private volatile boolean autoNextScheduled = false;
     private volatile long channelAttemptStartedAt = 0L;
     private volatile String playlistSource = "未加载";
 
@@ -498,7 +501,13 @@ public class MainActivity extends Activity {
     }
 
     private synchronized void handlePlaybackStall(String reason) {
-        if (destroyed || channels.isEmpty() || playbackHealthy) return;
+        if (destroyed || channels.isEmpty()) return;
+
+        // 即使之前已经正常播放过，后续真正卡死也要进入恢复流程。
+        if (playbackHealthy) {
+            playbackHealthy = false;
+            debugHealthySince = 0L;
+        }
         if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
         // 第一次卡住优先关闭硬解，用软件解码重试当前地址。
@@ -518,6 +527,16 @@ public class MainActivity extends Activity {
         if (!playbackRefreshTried && !playbackRefreshInProgress) {
             playbackRefreshTried = true;
             refreshSubscriptionAfterPlaybackFailure(reason);
+            return;
+        }
+
+        // 当前频道软件解码 + 订阅刷新都试过仍失败，无人值守场景自动换下一个频道。
+        if (playbackRefreshTried && !playbackRefreshInProgress) {
+            debugStage = "自动恢复失败，准备切换下一个频道";
+            status.setText(reason + "\n正在自动切换下一个频道…");
+            status.setVisibility(View.VISIBLE);
+            updateDebugPanel();
+            scheduleAutoNextChannel();
         }
     }
 
@@ -539,8 +558,10 @@ public class MainActivity extends Activity {
                 ResolvedPlaylist resolved = resolveSubscription(sub);
                 if (resolved.channels.isEmpty()) throw new IllegalStateException("新订阅没有有效频道");
 
+                writeSubscriptionCache(resolved.subscriptionText);
                 writePlaylistCacheToDisk(resolved.playlistText);
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putString(KEY_SUB_CACHE, resolved.subscriptionText)
                         .putString(KEY_CACHE, resolved.playlistText)
                         .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
                         .commit();
@@ -570,18 +591,47 @@ public class MainActivity extends Activity {
                     playbackRefreshInProgress = false;
                     debugStage = "自动更新订阅失败";
                     status.setText("播放失败，后台更新订阅也失败：\n" + err +
-                            "\n仍保留本地缓存，可按 ↑ / ↓ 换台");
+                            "\n正在自动切换下一个频道…");
                     status.setVisibility(View.VISIBLE);
                     updateDebugPanel();
+                    scheduleAutoNextChannel();
                 });
             }
         }, "playback-recovery-subscription").start();
     }
 
+    private void scheduleAutoNextChannel() {
+        if (autoNextScheduled || destroyed || channels.isEmpty()) return;
+        autoNextScheduled = true;
+        final int generation = playbackGeneration;
+        ui.postDelayed(() -> {
+            autoNextScheduled = false;
+            if (destroyed || channels.isEmpty()) return;
+            if (playbackHealthy) return;
+            if (generation != playbackGeneration) return; // 用户已经手动换台
+            current++;
+            if (current >= channels.size()) current = 0;
+            playCurrent();
+        }, 2500);
+    }
+
     private void playCurrentAfterRefresh() {
         if (channels.isEmpty()) return;
-        resetAttemptTelemetry(true);
+        resetAttemptTelemetry(false);
+        // 这次已经完成过一次订阅刷新，若新地址仍失败则不要死循环刷新。
+        playbackRefreshTried = true;
+        playbackRefreshInProgress = false;
+        softwareFallbackUsed = false;
+        forceSoftwareDecode = false;
         queuePlayCurrent();
+
+        // 新订阅地址仍无法播放时，稍后自动切下一个频道。
+        final int generation = playbackGeneration;
+        ui.postDelayed(() -> {
+            if (!destroyed && generation == playbackGeneration && !playbackHealthy) {
+                scheduleAutoNextChannel();
+            }
+        }, 12000);
     }
 
     private void resetAttemptTelemetry(boolean resetRecoveryFlags) {
@@ -607,6 +657,7 @@ public class MainActivity extends Activity {
         channelAttemptStartedAt = System.currentTimeMillis();
 
         if (resetRecoveryFlags) {
+            autoNextScheduled = false;
             softwareFallbackUsed = false;
             forceSoftwareDecode = false;
             playbackRefreshTried = false;
@@ -663,7 +714,7 @@ public class MainActivity extends Activity {
         playlistSource = "首次网络加载";
         status.setText("本地没有任何频道列表，正在首次加载直播订阅…");
         status.setVisibility(View.VISIBLE);
-        refreshSubscription(true, false);
+        refreshSubscription(false, false);
     }
 
     private void startFromLocalPlaylist(SharedPreferences p, List<Channel> localChannels, boolean fromBundled) {
@@ -747,6 +798,18 @@ public class MainActivity extends Activity {
         }
     }
 
+    private boolean writeSubscriptionCache(String text) {
+        if (text == null || text.trim().isEmpty()) return false;
+        File dst = new File(getFilesDir(), SUB_CACHE_FILE_NAME);
+        try (FileOutputStream out = new FileOutputStream(dst, false)) {
+            out.write(text.getBytes(StandardCharsets.UTF_8));
+            out.flush();
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private int findSameChannelIndex(List<Channel> items, Channel oldChannel, int fallback) {
         if (items == null || items.isEmpty()) return 0;
         if (oldChannel != null) {
@@ -781,8 +844,10 @@ public class MainActivity extends Activity {
                     throw new IllegalStateException("直播列表中没有有效频道");
                 }
 
+                writeSubscriptionCache(resolved.subscriptionText);
                 writePlaylistCacheToDisk(resolved.playlistText);
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putString(KEY_SUB_CACHE, resolved.subscriptionText)
                         .putString(KEY_CACHE, resolved.playlistText)
                         .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
                         .commit();
@@ -795,6 +860,7 @@ public class MainActivity extends Activity {
                             currentNow >= 0 ? currentNow : oldIndex);
                     setChannels(resolved.channels);
                     current = newIndex;
+                    playlistSource = "Gitee/网络更新成功";
 
                     if (silentBackground && hasUsableCache) {
                         return;
@@ -811,9 +877,8 @@ public class MainActivity extends Activity {
                 final String reason = friendlyError(e);
                 ui.post(() -> {
                     if (channels.isEmpty()) {
-                        status.setText("订阅加载失败\n" + reason + "\n\n按菜单键进入订阅设置");
+                        status.setText("订阅加载失败\n" + reason + "\n正在继续尝试本地/内置频道");
                         status.setVisibility(View.VISIBLE);
-                        if (forceSettingsOnFail) ui.postDelayed(this::openSettings, 1200);
                     } else if (!silentBackground) {
                         Toast.makeText(this, "订阅更新失败：" + reason + "，继续使用本地缓存", Toast.LENGTH_LONG).show();
                     }
@@ -827,7 +892,7 @@ public class MainActivity extends Activity {
 
         List<Channel> direct = PlaylistParser.parse(first);
         if (!direct.isEmpty()) {
-            return new ResolvedPlaylist(first, direct);
+            return new ResolvedPlaylist(first, first, direct);
         }
 
         List<String> liveUrls;
@@ -843,7 +908,7 @@ public class MainActivity extends Activity {
                 String playlist = downloadWithFallback(liveUrl);
                 List<Channel> parsed = PlaylistParser.parse(playlist);
                 if (!parsed.isEmpty()) {
-                    return new ResolvedPlaylist(playlist, parsed);
+                    return new ResolvedPlaylist(first, playlist, parsed);
                 }
                 if (errors.length() > 0) errors.append("；");
                 errors.append("列表为空: ").append(liveUrl);
@@ -856,10 +921,12 @@ public class MainActivity extends Activity {
     }
 
     private static final class ResolvedPlaylist {
+        final String subscriptionText;
         final String playlistText;
         final List<Channel> channels;
 
-        ResolvedPlaylist(String playlistText, List<Channel> channels) {
+        ResolvedPlaylist(String subscriptionText, String playlistText, List<Channel> channels) {
+            this.subscriptionText = subscriptionText;
             this.playlistText = playlistText;
             this.channels = channels;
         }
