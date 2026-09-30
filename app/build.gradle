@@ -10,8 +10,8 @@ android {
         applicationId 'com.daosheng.selenelivetv'
         minSdk 28
         targetSdk 35
-        versionCode 14
-        versionName '1.4.8-android9-bundled-fallback'
+        versionCode 15
+        versionName '1.4.9-android9-gitee-primary'
         ndk { abiFilters 'armeabi-v7a' }
     }
 }
