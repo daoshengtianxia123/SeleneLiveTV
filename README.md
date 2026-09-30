@@ -197,3 +197,17 @@ https://gitee.com/daoshengtianxia/selene-iptv/raw/main/selene-sub.txt
 - ↑/↓ 人工切台会清掉尚未执行的自动恢复任务，并生成新的 playback generation，因此用户操作永远优先。
 - 不自动换台，不自动切软件解码；异常只重连当前频道、必要时重建播放器或刷新同名频道地址，最终由用户决定是否换台。
 - Gitee 后台更新的新列表只有在“这份候选列表本身”实际稳定播放后才会晋升为正式缓存，避免健康旧流误把未验证列表写成好缓存。
+
+
+## 稳定播放控制收敛（1.6.1）
+
+针对 1.6.0 在虚拟机/弱设备上出现“切台卡死、虚拟机被拖死、无法播放”的问题：
+
+- 移除“5 秒 watchdog 跨线程 destroy MPV”的激进恢复方式。
+- 不再在一个 native command 尚未返回时从另一个线程销毁同一个 libmpv 实例。
+- 人工切台不再先执行 `stop`，直接使用 mpv 标准 `loadfile <url> replace`。
+- PlaybackController 仍保持单一专用控制线程，避免多线程同时操作 MPV。
+- 连续 ↑/↓ 会清掉尚未执行的旧切台任务，只保留用户最后选择。
+- 播放卡住时只显示“网络/直播源异常，请手动换台”，不再自动重连、自动重建播放器、自动软解或自动切台。
+- Gitee/缓存更新仍在独立后台线程中，不阻塞播放控制。
+- 当前 APK 仍面向真实 ARM Android TV/盒子（armeabi-v7a）；x86/x86_64 Android 虚拟机若进行 ARM native 转译，1080P libmpv 播放性能不能代表真实设备。
