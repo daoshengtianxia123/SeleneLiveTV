@@ -585,6 +585,9 @@ public class MainActivity extends Activity {
             status.setVisibility(View.VISIBLE);
             if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
+            if (pendingPlaylistText != null && !pendingPlaylistText.trim().isEmpty()) {
+                pendingCachePromotion = true;
+            }
             resetAttemptTelemetry(false);
             updateDebugPanel();
             if (playbackController != null) {
@@ -882,10 +885,20 @@ public class MainActivity extends Activity {
                     // 已有能用的本地缓存时，后台更新只保存为候选，不立刻覆盖“好缓存”。
                     // 这样即使 Gitee 新列表里某些源在本地网络不可用，下次开机仍使用已验证列表。
                     if (hasUsableCache) {
+                        // 后台拿到新列表后先更新“内存中的频道线路集合”，不打断当前正在播放的流。
+                        // 这样旧版单线路缓存也能自动升级为多线路，不需要用户卸载/清数据。
+                        Channel playingNow = current >= 0 && current < channels.size()
+                                ? channels.get(current) : oldChannel;
+                        int fallbackIndex = current >= 0 ? current : oldIndex;
+                        int newIndex = findSameChannelIndex(resolved.channels, playingNow, fallbackIndex);
+
                         stagePendingCache(resolved, false);
-                        playlistSource = "已验证本地缓存（后台更新待验证）";
+                        setChannels(resolved.channels);
+                        current = newIndex;
+                        playlistSource = "网络多线路列表（待播放验证）";
+
                         if (!silentBackground) {
-                            Toast.makeText(this, "订阅已更新，待当前网络验证后再替换缓存",
+                            Toast.makeText(this, "频道线路已后台更新",
                                     Toast.LENGTH_SHORT).show();
                         }
                         updateDebugPanel();
@@ -1109,6 +1122,9 @@ public class MainActivity extends Activity {
         if (current < 0) current = channels.size() - 1;
         if (current >= channels.size()) current = 0;
         Channel ch = channels.get(current);
+        if (pendingPlaylistText != null && !pendingPlaylistText.trim().isEmpty()) {
+            pendingCachePromotion = true;
+        }
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_LAST, current).apply();
         overlay.setText((current + 1) + "  " + ch.name + (ch.group.isEmpty() ? "" : "\n" + ch.group));
         overlay.setVisibility(View.VISIBLE);
