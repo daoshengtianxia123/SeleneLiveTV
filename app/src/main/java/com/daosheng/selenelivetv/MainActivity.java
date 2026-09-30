@@ -534,7 +534,7 @@ public class MainActivity extends Activity {
 
         // 阶段1/2：还没真正建立视频解码，不要误判成硬解问题。
         // 先彻底停止当前流，再用相同URL干净重连一次。
-        if (!debugVideoReady && !hadBeenHealthy && streamReconnectCount < 1) {
+        if (!debugVideoReady && !hadBeenHealthy && !softwareFallbackUsed && streamReconnectCount < 1) {
             streamReconnectCount++;
             forceSoftwareDecode = false;
             debugStage = "自动恢复：直播源干净重连 " + streamReconnectCount + "/1";
@@ -550,6 +550,7 @@ public class MainActivity extends Activity {
         // 这时才尝试关闭硬解，验证是否为硬件解码兼容问题。
         if ((debugVideoReady || hadBeenHealthy) && !softwareFallbackUsed) {
             softwareFallbackUsed = true;
+            streamReconnectCount = Math.max(streamReconnectCount, 1);
             forceSoftwareDecode = true;
             debugStage = "自动恢复：切换软件解码重试";
             status.setText(reason + "\n正在切换软件解码重试…");
