@@ -103,7 +103,6 @@ public class MainActivity extends Activity {
     private volatile boolean forceSoftwareDecode = false;
     private volatile boolean playbackRefreshInProgress = false;
     private volatile boolean playbackRefreshTried = false;
-    private volatile boolean autoNextScheduled = false;
     private volatile long lastPlaybackTriggeredRefreshAt = 0L;
     private volatile long channelAttemptStartedAt = 0L;
     private volatile String playlistSource = "未加载";
@@ -574,13 +573,10 @@ public class MainActivity extends Activity {
             }
         }
 
-        // 已经刷新过订阅，或者60秒内刚刷新过，仍然失败时直接自动换台。
+        // 已经完成当前频道可做的自动恢复，不自动换台。
+        // 保持在当前频道，提示用户网络/直播源状态，让用户自行按上下键换台。
         if (playbackRefreshTried && !playbackRefreshInProgress) {
-            debugStage = "自动恢复失败，准备切换下一个频道";
-            status.setText(reason + "\n正在自动切换下一个频道…");
-            status.setVisibility(View.VISIBLE);
-            updateDebugPanel();
-            scheduleAutoNextChannel();
+            showCurrentChannelUnavailable(reason);
         }
     }
 
@@ -673,29 +669,10 @@ public class MainActivity extends Activity {
                 ui.post(() -> {
                     playbackRefreshInProgress = false;
                     debugStage = "自动更新订阅失败";
-                    status.setText("播放失败，后台更新订阅也失败：\n" + err +
-                            "\n正在自动切换下一个频道…");
-                    status.setVisibility(View.VISIBLE);
-                    updateDebugPanel();
-                    scheduleAutoNextChannel();
+                    showCurrentChannelUnavailable("后台更新订阅失败：" + err);
                 });
             }
         }, "playback-recovery-subscription").start();
-    }
-
-    private void scheduleAutoNextChannel() {
-        if (autoNextScheduled || destroyed || channels.isEmpty()) return;
-        autoNextScheduled = true;
-        final int generation = playbackGeneration;
-        ui.postDelayed(() -> {
-            autoNextScheduled = false;
-            if (destroyed || channels.isEmpty()) return;
-            if (playbackHealthy) return;
-            if (generation != playbackGeneration) return; // 用户已经手动换台
-            current++;
-            if (current >= channels.size()) current = 0;
-            playCurrent();
-        }, 2500);
     }
 
     private void playCurrentAfterRefresh() {
@@ -708,13 +685,31 @@ public class MainActivity extends Activity {
         forceSoftwareDecode = false;
         queuePlayCurrent();
 
-        // 新订阅地址仍无法播放时，稍后自动切下一个频道。
+        // 新订阅地址仍无法播放时，只提示，不自动切台。
         final int generation = playbackGeneration;
         ui.postDelayed(() -> {
             if (!destroyed && generation == playbackGeneration && !playbackHealthy) {
-                scheduleAutoNextChannel();
+                showCurrentChannelUnavailable("当前频道恢复后仍未正常播放");
             }
         }, 12000);
+    }
+
+    private void showCurrentChannelUnavailable(String reason) {
+        if (destroyed) return;
+        debugStage = "当前频道暂时不可用，等待用户手动换台";
+        if (debugView != null) debugView.setVisibility(View.VISIBLE);
+
+        String name = channels.isEmpty() || current < 0 || current >= channels.size()
+                ? "当前频道" : channels.get(current).name;
+
+        status.setText(
+                name + " 暂时无法流畅播放\n" +
+                reason + "\n" +
+                "可能是网络较差或直播源暂时异常\n" +
+                "请按 ↑ / ↓ 手动切换频道"
+        );
+        status.setVisibility(View.VISIBLE);
+        updateDebugPanel();
     }
 
     private void resetAttemptTelemetry(boolean resetRecoveryFlags) {
@@ -740,7 +735,6 @@ public class MainActivity extends Activity {
         channelAttemptStartedAt = System.currentTimeMillis();
 
         if (resetRecoveryFlags) {
-            autoNextScheduled = false;
             softwareFallbackUsed = false;
             forceSoftwareDecode = false;
             playbackRefreshTried = false;
