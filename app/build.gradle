@@ -10,8 +10,8 @@ android {
         applicationId 'com.daosheng.selenelivetv'
         minSdk 28
         targetSdk 35
-        versionCode 20
-        versionName '1.5.4-verified-cache-audio-fix'
+        versionCode 21
+        versionName '1.5.5-manual-priority-no-softfallback'
         ndk { abiFilters 'armeabi-v7a' }
     }
 }
