@@ -109,6 +109,11 @@ public class MainActivity extends Activity {
     private volatile long channelAttemptStartedAt = 0L;
     private volatile String playlistSource = "未加载";
 
+    // 网络更新先作为“候选列表”试播，只有真正稳定播放后才覆盖已验证本地缓存。
+    private volatile boolean pendingCachePromotion = false;
+    private volatile String pendingSubscriptionText = null;
+    private volatile String pendingPlaylistText = null;
+
     private int current = 0;
     private boolean listVisible = false;
 
@@ -229,6 +234,11 @@ public class MainActivity extends Activity {
             player.setOptionString("hwdec", "auto-safe");
             player.setOptionString("hwdec-codecs", "all");
             player.setOptionString("ao", "audiotrack");
+            // 老款 Android 9 电视/盒子对部分 MP2/AAC 输出格式兼容较差，
+            // 固定为常见的 48kHz / 16-bit / 双声道，减少爆音、破音。
+            player.setOptionString("audio-samplerate", "48000");
+            player.setOptionString("audio-format", "s16");
+            player.setOptionString("audio-channels", "stereo");
             player.setOptionString("cache", "yes");
             // 国内 IPTV 直播优先快速起播，避免大缓存把阶段2拖很久。
             player.setOptionString("cache-secs", "3");
@@ -462,8 +472,19 @@ public class MainActivity extends Activity {
             updateDebugPanel();
             checkPlaybackRecovery();
 
-            // 真正持续播放满2秒，且最近仍有播放进度，就自动隐藏调试窗口。
+            // 真正持续播放满2秒且进度持续增长，候选网络列表才晋升为正式缓存。
             long now = System.currentTimeMillis();
+            if (pendingCachePromotion &&
+                    playbackHealthy &&
+                    !debugPausedForCache &&
+                    debugHealthySince > 0 &&
+                    now - debugHealthySince >= 2000 &&
+                    debugLastProgressAt > 0 &&
+                    now - debugLastProgressAt <= 1500) {
+                promotePendingCache();
+            }
+
+            // 真正持续播放满2秒，且最近仍有播放进度，就自动隐藏调试窗口。
             if (debugView != null &&
                     debugView.getVisibility() == View.VISIBLE &&
                     playbackHealthy &&
@@ -710,20 +731,13 @@ public class MainActivity extends Activity {
                 ResolvedPlaylist resolved = resolveSubscription(sub);
                 if (resolved.channels.isEmpty()) throw new IllegalStateException("新订阅没有有效频道");
 
-                writeSubscriptionCache(resolved.subscriptionText);
-                writePlaylistCacheToDisk(resolved.playlistText);
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                        .putString(KEY_SUB_CACHE, resolved.subscriptionText)
-                        .putString(KEY_CACHE, resolved.playlistText)
-                        .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
-                        .commit();
-
                 ui.post(() -> {
                     if (destroyed) return;
                     int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
+                    stagePendingCache(resolved);
                     setChannels(resolved.channels);
                     current = newIndex;
-                    playlistSource = "Gitee/网络更新成功";
+                    playlistSource = "Gitee候选列表（等待播放验证）";
                     playbackRefreshInProgress = false;
                     playbackRefreshTried = true;
 
@@ -770,6 +784,8 @@ public class MainActivity extends Activity {
 
     private void showCurrentChannelUnavailable(String reason) {
         if (destroyed) return;
+        // 候选网络列表没有通过播放验证，绝不覆盖原来的好缓存。
+        if (pendingCachePromotion) clearPendingCache();
         debugStage = "当前频道暂时不可用，等待用户手动换台";
         if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
@@ -816,6 +832,41 @@ public class MainActivity extends Activity {
             playbackRefreshTried = false;
             playbackRefreshInProgress = false;
         }
+        updateDebugPanel();
+    }
+
+    private void stagePendingCache(ResolvedPlaylist resolved) {
+        if (resolved == null || resolved.channels == null || resolved.channels.isEmpty()) return;
+        pendingSubscriptionText = resolved.subscriptionText;
+        pendingPlaylistText = resolved.playlistText;
+        pendingCachePromotion = true;
+    }
+
+    private void clearPendingCache() {
+        pendingCachePromotion = false;
+        pendingSubscriptionText = null;
+        pendingPlaylistText = null;
+    }
+
+    private void promotePendingCache() {
+        if (!pendingCachePromotion) return;
+        final String subText = pendingSubscriptionText;
+        final String listText = pendingPlaylistText;
+        if (listText == null || PlaylistParser.parse(listText).isEmpty()) {
+            clearPendingCache();
+            return;
+        }
+
+        writeSubscriptionCache(subText == null ? "" : subText);
+        writePlaylistCacheToDisk(listText);
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(KEY_SUB_CACHE, subText == null ? "" : subText)
+                .putString(KEY_CACHE, listText)
+                .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
+                .commit();
+
+        clearPendingCache();
+        playlistSource = "已验证可播放缓存";
         updateDebugPanel();
     }
 
@@ -997,33 +1048,29 @@ public class MainActivity extends Activity {
                     throw new IllegalStateException("直播列表中没有有效频道");
                 }
 
-                writeSubscriptionCache(resolved.subscriptionText);
-                writePlaylistCacheToDisk(resolved.playlistText);
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                        .putString(KEY_SUB_CACHE, resolved.subscriptionText)
-                        .putString(KEY_CACHE, resolved.playlistText)
-                        .putLong(KEY_CACHE_TIME, System.currentTimeMillis())
-                        .commit();
-
                 ui.post(() -> {
-                    Channel playingNow = !channels.isEmpty() && current >= 0 && current < channels.size()
-                            ? channels.get(current) : oldChannel;
-                    int currentNow = current;
-                    int newIndex = findSameChannelIndex(resolved.channels, playingNow,
-                            currentNow >= 0 ? currentNow : oldIndex);
-                    setChannels(resolved.channels);
-                    current = newIndex;
-                    playlistSource = "Gitee/网络更新成功";
-
-                    if (silentBackground && hasUsableCache) {
+                    // 已有能用的本地缓存时，后台更新只保存为候选，不立刻覆盖“好缓存”。
+                    // 这样即使 Gitee 新列表里某些源在本地网络不可用，下次开机仍使用已验证列表。
+                    if (hasUsableCache) {
+                        stagePendingCache(resolved);
+                        playlistSource = "已验证本地缓存（后台更新待验证）";
+                        if (!silentBackground) {
+                            Toast.makeText(this, "订阅已更新，待当前网络验证后再替换缓存",
+                                    Toast.LENGTH_SHORT).show();
+                        }
+                        updateDebugPanel();
                         return;
                     }
 
+                    // 完全没有可用列表时才直接使用网络列表，并等真正播放成功后再晋升缓存。
+                    stagePendingCache(resolved);
+                    int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
+                    setChannels(resolved.channels);
+                    current = newIndex;
+                    playlistSource = "网络候选列表（等待播放验证）";
+
                     status.setText("订阅加载成功，共 " + channels.size() + " 个频道");
                     status.setVisibility(View.VISIBLE);
-                    ui.postDelayed(() -> {
-                        if (!channels.isEmpty()) status.setVisibility(View.GONE);
-                    }, 1200);
                     playCurrent();
                 });
             } catch (Exception e) {
