@@ -50,6 +50,7 @@ public class MainActivity extends Activity {
     private static final String CACHE_FILE_NAME = "playlist_cache.m3u";
     private static final String SUB_CACHE_FILE_NAME = "selene-sub-cache.txt";
     private static final String KEY_LAST = "last_channel";
+    private static final String KEY_LINE_PREFIX = "last_good_line_";
     private static final long CACHE_REFRESH_INTERVAL_MS = 6L * 60L * 60L * 1000L;
 
     private static final int REQ_SETTINGS = 1001;
@@ -104,6 +105,7 @@ public class MainActivity extends Activity {
     private volatile long channelAttemptStartedAt = 0L;
     private volatile long lastManualSwitchAt = 0L;
     private volatile boolean stallWarningShown = false;
+    private volatile int currentLineTries = 1;
     private volatile String playlistSource = "未加载";
 
     // 网络更新先作为“候选列表”试播，只有真正稳定播放后才覆盖已验证本地缓存。
@@ -322,7 +324,10 @@ public class MainActivity extends Activity {
                                 debugLastTimePos = value;
                                 debugLastProgressAt = System.currentTimeMillis();
                                 if (value > 0.25) {
-                                    if (!playbackHealthy) debugHealthySince = System.currentTimeMillis();
+                                    if (!playbackHealthy) {
+                                        debugHealthySince = System.currentTimeMillis();
+                                        rememberCurrentWorkingLine();
+                                    }
                                     playbackHealthy = true;
                                     debugStage = "4/4 正在连续播放";
                                     status.setVisibility(View.GONE);
@@ -461,6 +466,11 @@ public class MainActivity extends Activity {
         if (debugView == null) return;
         String channelName = channels.isEmpty() || current < 0 || current >= channels.size()
                 ? "-" : channels.get(current).name;
+        String lineInfo = "-";
+        if (!channels.isEmpty() && current >= 0 && current < channels.size()) {
+            Channel ch = channels.get(current);
+            lineInfo = ch.lineNumber() + "/" + ch.lineCount();
+        }
         String resolution = (debugWidth > 0 && debugHeight > 0)
                 ? debugWidth + "x" + debugHeight : "-";
         String buffer = debugBufferPercent >= 0
@@ -476,7 +486,7 @@ public class MainActivity extends Activity {
                 "阶段：" + debugStage + "\n" +
                 "订阅：" + playlistSource + "\n" +
                 "事件：" + debugLastEvent + "\n" +
-                "直播源：" + currentHost() + "\n" +
+                "直播源：" + currentHost() + "  线路：" + lineInfo + "\n" +
                 "缓存：" + buffer + "  已缓存：" + cache + "\n" +
                 "视频：" + debugVideoCodec + " / " + debugVideoFormat + " / " + resolution + "\n" +
                 "音频：" + debugAudioCodec + "\n" +
@@ -557,18 +567,40 @@ public class MainActivity extends Activity {
 
     private synchronized void handlePlaybackStall(String reason) {
         if (destroyed || channels.isEmpty() || stallWarningShown) return;
+        if (current < 0 || current >= channels.size()) return;
 
-        stallWarningShown = true;
+        Channel ch = channels.get(current);
         playbackHealthy = false;
         debugHealthySince = 0L;
-        debugStage = "当前频道网络/直播源异常";
+
+        // 不换频道、不切软件解码。只在同一个频道内部尝试下一条备用线路。
+        if (ch.lineCount() > 1 && currentLineTries < ch.lineCount() && ch.switchToNextLine()) {
+            currentLineTries++;
+            stallWarningShown = false;
+            debugStage = "当前频道切换备用线路 " + ch.lineNumber() + "/" + ch.lineCount();
+            status.setText(
+                    ch.name + " 当前线路较慢\n" +
+                    "正在尝试备用线路 " + ch.lineNumber() + "/" + ch.lineCount() + "…"
+            );
+            status.setVisibility(View.VISIBLE);
+            if (debugView != null) debugView.setVisibility(View.VISIBLE);
+
+            resetAttemptTelemetry(false);
+            updateDebugPanel();
+            if (playbackController != null) {
+                playbackController.reconnectCurrent(ch, playbackGeneration);
+            }
+            return;
+        }
+
+        stallWarningShown = true;
+        debugStage = "当前频道所有线路暂时不可用";
         if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
-        String name = current >= 0 && current < channels.size()
-                ? channels.get(current).name : "当前频道";
         status.setText(
-                name + " 暂时无法流畅播放\n" +
+                ch.name + " 暂时无法流畅播放\n" +
                 reason + "\n" +
+                "已尝试 " + currentLineTries + "/" + ch.lineCount() + " 条线路\n" +
                 "请按 ↑ / ↓ 手动切换频道"
         );
         status.setVisibility(View.VISIBLE);
@@ -1047,7 +1079,26 @@ public class MainActivity extends Activity {
         }
     }
 
+    private String linePreferenceKey(Channel ch) {
+        return KEY_LINE_PREFIX + ch.group + "|" + ch.name;
+    }
+
+    private void rememberCurrentWorkingLine() {
+        if (channels.isEmpty() || current < 0 || current >= channels.size()) return;
+        Channel ch = channels.get(current);
+        if (ch.url == null || ch.url.trim().isEmpty()) return;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(linePreferenceKey(ch), ch.url)
+                .apply();
+    }
+
     private void setChannels(List<Channel> items) {
+        SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+        for (Channel ch : items) {
+            String preferred = prefs.getString(linePreferenceKey(ch), "");
+            if (preferred != null && !preferred.isEmpty()) ch.selectUrl(preferred);
+        }
+
         channels.clear();
         channels.addAll(items);
         list.setAdapter(new ArrayAdapter<Channel>(this, android.R.layout.simple_list_item_1, channels));
@@ -1071,6 +1122,7 @@ public class MainActivity extends Activity {
 
         playbackRetryCount = 0;
         streamReconnectCount = 0;
+        currentLineTries = 1;
 
         if (!surfaceReady || !mpvInitialized || player == null) {
             pendingPlay = true;
