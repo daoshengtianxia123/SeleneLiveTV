@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class MainActivity extends Activity {
     public static final String DEFAULT_SUB_URL =
-            "https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt";
+            "https://gitee.com/daoshengtianxia/selene-iptv/raw/main/selene-sub.txt";
     public static final String PREFS = "selene_live_prefs";
     public static final String KEY_SUB_URL = "subscription_url";
     private static final String KEY_CACHE = "playlist_cache";
@@ -899,18 +899,37 @@ public class MainActivity extends Activity {
         List<String> urls = new ArrayList<>();
         try {
             URL u = new URL(address);
-            if ("raw.githubusercontent.com".equalsIgnoreCase(u.getHost())) {
-                String[] parts = u.getPath().split("/", 5);
+            String host = u.getHost();
+            String path = u.getPath();
+
+            // 主线路：Gitee。若 Gitee 暂时失败，则回退到 jsDelivr / GitHub Raw。
+            if ("gitee.com".equalsIgnoreCase(host) &&
+                    path.startsWith("/daoshengtianxia/selene-iptv/raw/main/")) {
+                String filePath = path.substring("/daoshengtianxia/selene-iptv/raw/main/".length());
+                addUnique(urls, address);
+                addUnique(urls, "https://cdn.jsdelivr.net/gh/daoshengtianxia123/selene-iptv@main/" + filePath);
+                addUnique(urls, "https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/" + filePath);
+                addUnique(urls, "https://github.com/daoshengtianxia123/selene-iptv/raw/refs/heads/main/" + filePath);
+                return urls;
+            }
+
+            // 兼容旧配置：用户若仍保存 GitHub Raw 地址，也优先尝试 Gitee。
+            if ("raw.githubusercontent.com".equalsIgnoreCase(host)) {
+                String[] parts = path.split("/", 5);
                 if (parts.length >= 5) {
                     String owner = parts[1];
                     String repo = parts[2];
                     String branch = parts[3];
-                    String path = parts[4];
+                    String filePath = parts[4];
 
-                    // TV 不开 VPN 时优先试 CDN，避免 raw.githubusercontent.com DNS/路由问题。
-                    addUnique(urls, "https://cdn.jsdelivr.net/gh/" + owner + "/" + repo + "@" + branch + "/" + path);
+                    if ("daoshengtianxia123".equalsIgnoreCase(owner) &&
+                            "selene-iptv".equalsIgnoreCase(repo) &&
+                            "main".equalsIgnoreCase(branch)) {
+                        addUnique(urls, "https://gitee.com/daoshengtianxia/selene-iptv/raw/main/" + filePath);
+                    }
+                    addUnique(urls, "https://cdn.jsdelivr.net/gh/" + owner + "/" + repo + "@" + branch + "/" + filePath);
                     addUnique(urls, address);
-                    addUnique(urls, "https://github.com/" + owner + "/" + repo + "/raw/refs/heads/" + branch + "/" + path);
+                    addUnique(urls, "https://github.com/" + owner + "/" + repo + "/raw/refs/heads/" + branch + "/" + filePath);
                     return urls;
                 }
             }
