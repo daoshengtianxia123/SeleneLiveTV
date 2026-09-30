@@ -1,7 +1,9 @@
 package com.daosheng.selenelivetv;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -11,8 +13,9 @@ public final class PlaylistParser {
     private PlaylistParser() {}
 
     public static List<Channel> parse(String text) {
-        List<Channel> out = new ArrayList<>();
-        if (text == null) return out;
+        LinkedHashMap<String, Channel> grouped = new LinkedHashMap<>();
+        if (text == null) return new ArrayList<>();
+
         String[] lines = text.replace("\r", "").split("\n");
         String pendingName = null;
         String pendingGroup = "其他";
@@ -31,7 +34,7 @@ public final class PlaylistParser {
             }
 
             if (isUrl(line)) {
-                out.add(new Channel(pendingName, pendingGroup, line));
+                addOrMerge(grouped, pendingName, pendingGroup, line);
                 pendingName = null;
                 pendingGroup = "其他";
                 continue;
@@ -48,11 +51,25 @@ public final class PlaylistParser {
                 }
 
                 if (isUrl(right)) {
-                    out.add(new Channel(left, currentTextGroup, right));
+                    addOrMerge(grouped, left, currentTextGroup, right);
                 }
             }
         }
-        return out;
+
+        return new ArrayList<>(grouped.values());
+    }
+
+    private static void addOrMerge(Map<String, Channel> grouped, String name, String group, String url) {
+        String safeName = name == null || name.trim().isEmpty() ? "未命名频道" : name.trim();
+        String safeGroup = group == null || group.trim().isEmpty() ? "其他" : group.trim();
+        String key = safeGroup + "\n" + safeName;
+
+        Channel old = grouped.get(key);
+        if (old == null) {
+            grouped.put(key, new Channel(safeName, safeGroup, url));
+        } else {
+            old.addUrl(url);
+        }
     }
 
     private static boolean isUrl(String s) {
