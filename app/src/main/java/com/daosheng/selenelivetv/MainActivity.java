@@ -97,7 +97,8 @@ public class MainActivity extends Activity {
     private volatile String debugLastEvent = "-";
 
     // 自动恢复状态：
-    // 1) 本地缓存先播；2) 解码卡住先切软件解码；3) 仍失败则后台刷新订阅并替换缓存。
+    // 本地缓存先播；异常时只重连当前频道/重建播放器/刷新订阅。
+    // 不再自动切软件解码，避免恢复动作反而把播放器卡住。
     private volatile boolean playbackHealthy = false;
     private volatile boolean softwareFallbackUsed = false;
     private volatile boolean forceSoftwareDecode = false;
@@ -107,6 +108,7 @@ public class MainActivity extends Activity {
     private volatile boolean playerCoreRestarting = false;
     private volatile long lastPlaybackTriggeredRefreshAt = 0L;
     private volatile long channelAttemptStartedAt = 0L;
+    private volatile long lastManualSwitchAt = 0L;
     private volatile String playlistSource = "未加载";
 
     // 网络更新先作为“候选列表”试播，只有真正稳定播放后才覆盖已验证本地缓存。
@@ -296,9 +298,7 @@ public class MainActivity extends Activity {
                                 if (value > 0.25) {
                                     if (!playbackHealthy) debugHealthySince = System.currentTimeMillis();
                                     playbackHealthy = true;
-                                    debugStage = forceSoftwareDecode
-                                            ? "4/4 软件解码正在连续播放"
-                                            : "4/4 正在连续播放";
+                                    debugStage = "4/4 正在连续播放";
                                     status.setVisibility(View.GONE);
                                 }
                             }
@@ -366,9 +366,7 @@ public class MainActivity extends Activity {
                 debugAudioReady = true;
                 break;
             case 21: // PLAYBACK_RESTART
-                debugStage = forceSoftwareDecode
-                        ? "4/4 软件解码正在连续播放"
-                        : "4/4 正在连续播放";
+                debugStage = "4/4 正在连续播放";
                 if (!playbackHealthy) debugHealthySince = System.currentTimeMillis();
                 playbackHealthy = true;
                 playbackRetryCount = 0;
@@ -428,9 +426,9 @@ public class MainActivity extends Activity {
         if (debugCoreIdle && debugFileLoaded) return "卡点：MPV 当前空闲";
         if (debugLastProgressAt > 0 && now - debugLastProgressAt > 3500) {
             return "卡点：播放时间已停止 " + ((now - debugLastProgressAt) / 1000) +
-                    " 秒" + (forceSoftwareDecode ? "（软件解码）" : "（硬解/自动）");
+                    " 秒（自动硬解）";
         }
-        return "状态：" + (forceSoftwareDecode ? "软件解码" : "自动解码") +
+        return "状态：自动硬解" +
                 (playbackHealthy ? "，数据持续播放" : "，正在建立播放");
     }
 
@@ -460,8 +458,7 @@ public class MainActivity extends Activity {
                 "时间：" + pos + "  cache=" + debugPausedForCache + "\n" +
                 "恢复：" + (playerCoreRestarting ? "正在重建播放器" :
                         (playbackRefreshInProgress ? "正在更新订阅" :
-                        (softwareFallbackUsed ? "已尝试软件解码" :
-                                (streamReconnectCount > 0 ? "已重连直播源" : "未触发")))) + "\n" +
+                                (streamReconnectCount > 0 ? "已重连当前频道" : "未触发"))) + "\n" +
                 detectPlaybackProblem()
         );
     }
@@ -542,7 +539,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 阶段3：视频解码器已经建立，但仍然没有时间轴推进，这时才值得尝试软件解码。
+        // 阶段3：视频解码器已经建立但时间轴不推进，仍只按当前频道异常处理，不自动切软件解码。
         if (debugVideoReady && debugTimePos <= 0.05 && elapsed >= 8000) {
             handlePlaybackStall("阶段3/4：视频解码已建立但8秒仍未开始播放");
             return;
@@ -567,7 +564,7 @@ public class MainActivity extends Activity {
         final int token = playToken.incrementAndGet();
         final Channel ch = channels.get(current);
 
-        playerExecutor.execute(() -> {
+        new Thread(() -> {
             MPVLib old = player;
             try {
                 if (old != null) {
@@ -619,20 +616,19 @@ public class MainActivity extends Activity {
     private synchronized void handlePlaybackStall(String reason) {
         if (destroyed || channels.isEmpty()) return;
 
-        boolean hadBeenHealthy = playbackHealthy;
         if (playbackHealthy) {
             playbackHealthy = false;
             debugHealthySince = 0L;
         }
         if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
-        // 阶段1/2：还没真正建立视频解码，不要误判成硬解问题。
-        // 先彻底停止当前流，再用相同URL干净重连一次。
-        if (!debugVideoReady && !hadBeenHealthy && !softwareFallbackUsed && streamReconnectCount < 1) {
+        // 不自动切软件解码。任何阶段卡住都只允许对“当前频道”做一次干净重连。
+        if (streamReconnectCount < 1) {
             streamReconnectCount++;
             forceSoftwareDecode = false;
-            debugStage = "自动恢复：直播源干净重连 " + streamReconnectCount + "/1";
-            status.setText(reason + "\n正在重新连接当前直播源…");
+            softwareFallbackUsed = false;
+            debugStage = "自动恢复：重连当前频道 1/1";
+            status.setText(reason + "\n正在重新连接当前频道…");
             status.setVisibility(View.VISIBLE);
             updateDebugPanel();
             resetAttemptTelemetry(false);
@@ -640,22 +636,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 已经建立过视频解码器，或者正常播放后又卡死：
-        // 这时才尝试关闭硬解，验证是否为硬件解码兼容问题。
-        if ((debugVideoReady || hadBeenHealthy) && !softwareFallbackUsed) {
-            softwareFallbackUsed = true;
-            streamReconnectCount = Math.max(streamReconnectCount, 1);
-            forceSoftwareDecode = true;
-            debugStage = "自动恢复：切换软件解码重试";
-            status.setText(reason + "\n正在切换软件解码重试…");
-            status.setVisibility(View.VISIBLE);
-            updateDebugPanel();
-            resetAttemptTelemetry(false);
-            queueCleanReconnectCurrent();
-            return;
-        }
-
-        // 同一URL重连/软件解码都无效，再更新频道列表。
+        // 当前频道重连仍失败，再后台刷新订阅，尝试同名频道的新URL。
         if (!playbackRefreshTried && !playbackRefreshInProgress) {
             long now = System.currentTimeMillis();
             if (now - lastPlaybackTriggeredRefreshAt >= 60000L) {
@@ -663,13 +644,11 @@ public class MainActivity extends Activity {
                 lastPlaybackTriggeredRefreshAt = now;
                 refreshSubscriptionAfterPlaybackFailure(reason);
                 return;
-            } else {
-                playbackRefreshTried = true;
             }
+            playbackRefreshTried = true;
         }
 
-        // 已经完成当前频道可做的自动恢复，不自动换台。
-        // 保持在当前频道，提示用户网络/直播源状态，让用户自行按上下键换台。
+        // 仍失败只提示，不换台、不切软解，等待用户按上下键。
         if (playbackRefreshTried && !playbackRefreshInProgress) {
             showCurrentChannelUnavailable(reason);
         }
@@ -681,7 +660,7 @@ public class MainActivity extends Activity {
         final Channel ch = channels.get(current);
         pendingPlay = false;
 
-        playerExecutor.execute(() -> {
+        new Thread(() -> {
             if (destroyed || token != playToken.get() || player == null || !mpvInitialized) return;
             try {
                 // 先 stop，释放上一个卡住的 demux/decoder 状态；短暂停顿后重新 loadfile。
@@ -689,13 +668,13 @@ public class MainActivity extends Activity {
                 try { Thread.sleep(180); } catch (InterruptedException ignored) {}
 
                 try {
-                    player.setPropertyString("hwdec", forceSoftwareDecode ? "no" : "auto-safe");
+                    player.setPropertyString("hwdec", "auto-safe");
                 } catch (Throwable ignored) {}
+                forceSoftwareDecode = false;
+                softwareFallbackUsed = false;
 
                 ui.post(() -> {
-                    debugStage = forceSoftwareDecode
-                            ? "重新连接（软件解码），等待 START_FILE"
-                            : "重新连接直播源，等待 START_FILE";
+                    debugStage = "重新连接当前频道，等待 START_FILE";
                     updateDebugPanel();
                 });
 
@@ -796,6 +775,7 @@ public class MainActivity extends Activity {
                 name + " 暂时无法流畅播放\n" +
                 reason + "\n" +
                 "可能是网络较差或直播源暂时异常\n" +
+                "不会自动切台/切软件解码\n" +
                 "请按 ↑ / ↓ 手动切换频道"
         );
         status.setVisibility(View.VISIBLE);
@@ -1290,7 +1270,7 @@ public class MainActivity extends Activity {
         final Channel ch = channels.get(current);
         pendingPlay = false;
 
-        playerExecutor.execute(() -> {
+        new Thread(() -> {
             if (destroyed || token != playToken.get() || !surfaceReady || player == null || !mpvInitialized) return;
             try {
                 ui.post(() -> {
@@ -1335,20 +1315,18 @@ public class MainActivity extends Activity {
         final int token = playToken.incrementAndGet();
         pendingPlay = false;
 
-        playerExecutor.execute(() -> {
+        new Thread(() -> {
             if (destroyed || token != playToken.get() || !surfaceReady || player == null || !mpvInitialized) return;
             try {
                 ui.post(() -> {
-                    debugStage = forceSoftwareDecode
-                            ? "已发送 loadfile（软件解码），等待 START_FILE"
-                            : "已发送 loadfile（自动解码），等待 START_FILE";
+                    debugStage = "已发送 loadfile（自动硬解），等待 START_FILE";
                     updateDebugPanel();
                 });
                 try {
-                    player.setPropertyString("hwdec", forceSoftwareDecode ? "no" : "auto-safe");
-                } catch (Throwable ignored) {
-                    // 某些 mpv 构建不允许运行时改 hwdec；loadfile 仍继续尝试。
-                }
+                    player.setPropertyString("hwdec", "auto-safe");
+                } catch (Throwable ignored) {}
+                forceSoftwareDecode = false;
+                softwareFallbackUsed = false;
                 player.command(new String[]{"loadfile", ch.url, "replace"});
                 player.setPropertyBoolean("pause", false);
                 ui.post(() -> {
@@ -1388,6 +1366,11 @@ public class MainActivity extends Activity {
 
     private void previousChannel() {
         if (channels.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        if (now - lastManualSwitchAt < 180) return;
+        lastManualSwitchAt = now;
+        // 用户手动切台优先：立刻使旧播放/恢复命令失效。
+        playToken.incrementAndGet();
         current--;
         if (current < 0) current = channels.size() - 1;
         playCurrent();
@@ -1395,6 +1378,11 @@ public class MainActivity extends Activity {
 
     private void nextChannel() {
         if (channels.isEmpty()) return;
+        long now = System.currentTimeMillis();
+        if (now - lastManualSwitchAt < 180) return;
+        lastManualSwitchAt = now;
+        // 用户手动切台优先：立刻使旧播放/恢复命令失效。
+        playToken.incrementAndGet();
         current++;
         if (current >= channels.size()) current = 0;
         playCurrent();
