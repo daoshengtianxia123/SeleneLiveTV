@@ -181,3 +181,19 @@ https://gitee.com/daoshengtianxia/selene-iptv/raw/main/selene-sub.txt
 - 仍失败只提示网络/直播源异常，不自动切台、不切软件解码。
 - 播放控制命令不再全部排在同一个单线程队列里，避免某个 native `loadfile/stop` 卡住后导致后续 ↑/↓ 切台也完全无响应。
 - 用户按 ↑/↓ 会立即使旧播放/恢复命令失效，人工切台优先。
+
+
+## PlaybackController 状态机重构（1.6.0）
+
+播放层改为更接近主流 TV/IPTV 播放器的分层：
+
+- UI 主线程：只处理遥控器、频道提示和状态显示。
+- PlaybackController：唯一负责 MPV 的 stop / loadfile / 当前频道重连，使用单独的专用控制线程串行执行，避免多个线程同时操作同一个 MPV 实例。
+- libmpv：继续由其内部线程负责网络读取、解复用、音视频解码、AudioTrack 和 Surface/GPU 输出。
+- SubscriptionWorker：Gitee 订阅、live.m3u、缓存更新继续走独立后台线程，不阻塞播放控制。
+- Watchdog：若播放控制线程卡在 native 调用超过约 5 秒，会放弃旧 worker、创建新的控制线程代际，并重建 MPV 播放 session；旧任务即使迟到返回也会因为 generation 失效。
+- MPV observer 增加 session id，旧播放器迟到的事件不会污染新播放器状态。
+- 播放故障触发的订阅刷新绑定到当时的 playback generation；用户在下载期间手动换台后，旧刷新结果不会把频道再切回去。
+- ↑/↓ 人工切台会清掉尚未执行的自动恢复任务，并生成新的 playback generation，因此用户操作永远优先。
+- 不自动换台，不自动切软件解码；异常只重连当前频道、必要时重建播放器或刷新同名频道地址，最终由用户决定是否换台。
+- Gitee 后台更新的新列表只有在“这份候选列表本身”实际稳定播放后才会晋升为正式缓存，避免健康旧流误把未验证列表写成好缓存。
