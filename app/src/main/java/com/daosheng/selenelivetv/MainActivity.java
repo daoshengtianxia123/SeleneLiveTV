@@ -610,7 +610,7 @@ public class MainActivity extends Activity {
                     updateDebugPanel();
                 });
             }
-        });
+        }, "mpv-core-restart").start();
     }
 
     private synchronized void handlePlaybackStall(String reason) {
@@ -689,7 +689,7 @@ public class MainActivity extends Activity {
                     }
                 });
             }
-        });
+        }, "iptv-reconnect").start();
     }
 
     private void refreshSubscriptionAfterPlaybackFailure(String reason) {
@@ -1305,7 +1305,7 @@ public class MainActivity extends Activity {
                     }
                 });
             }
-        });
+        }, "manual-channel-switch").start();
     }
 
     private void queuePlayCurrent() {
@@ -1342,7 +1342,7 @@ public class MainActivity extends Activity {
                     }
                 });
             }
-        });
+        }, "iptv-loadfile").start();
     }
 
     private void schedulePlaybackRetry(String reason) {
