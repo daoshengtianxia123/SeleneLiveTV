@@ -5,7 +5,7 @@
 ## 当前版本
 
 - 版本：`1.4.8-android9-bundled-fallback`
-- 默认订阅：`https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt`
+- 默认订阅：`https://gitee.com/daoshengtianxia/selene-iptv/raw/main/selene-sub.txt`
 - 支持 Selene Base58 订阅：先解码 JSON，再读取 `lives.*.url` 对应的 M3U。
 - 播放核心：`dev.jdtech.mpv:libmpv:1.0.0`（libmpv + FFmpeg）。
 - 遥控器：↑ 上一台、↓ 下一台、OK 频道列表、菜单键进入订阅设置。
@@ -97,3 +97,21 @@
 3. GitHub raw 备用入口
 
 这样不开 VPN 时更容易先拿到订阅，而直播频道播放仍直接访问频道自己的 URL，不经过订阅 CDN。
+
+
+## Gitee 主订阅（1.4.9）
+
+默认订阅已切换到中国大陆 Gitee：
+
+```
+https://gitee.com/daoshengtianxia/selene-iptv/raw/main/selene-sub.txt
+```
+
+订阅下载顺序：
+1. Gitee
+2. jsDelivr
+3. GitHub Raw
+4. GitHub raw 备用入口
+5. 本地/内置缓存继续兜底
+
+兼容旧版本保存的 GitHub Raw 地址：程序会自动优先尝试对应的 Gitee 镜像。
