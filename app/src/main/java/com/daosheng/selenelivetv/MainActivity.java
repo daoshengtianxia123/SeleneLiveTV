@@ -61,6 +61,7 @@ public class MainActivity extends Activity {
     private volatile boolean mpvInitialized = false;
     private volatile boolean surfaceReady = false;
     private volatile boolean destroyed = false;
+    private volatile int mpvSessionId = 0;
     private final AtomicInteger playToken = new AtomicInteger(0);
     private PlaybackController playbackController;
     private boolean pendingPlay = false;
@@ -152,7 +153,11 @@ public class MainActivity extends Activity {
                     debugStage = "播放控制线程疑似卡住";
                     statusTextSafe("播放器响应超时，正在重建当前播放会话…");
                     updateDebugPanel();
-                    restartPlayerCoreForCurrentChannel("播放控制命令卡住 " + (blockedMs / 1000) + " 秒");
+
+                    // 放弃被 JNI 卡住的旧 worker，建立新的控制线程代际。
+                    playbackGeneration = playbackController.abandonBlockedWorker();
+                    restartPlayerCoreForCurrentChannel(
+                            "播放控制命令卡住 " + (blockedMs / 1000) + " 秒");
                 });
             }
         });
@@ -291,18 +296,26 @@ public class MainActivity extends Activity {
                 player.attachSurface(holder.getSurface());
             }
             mpvInitialized = true;
+            final int observerSession = ++mpvSessionId;
             if (playbackController != null) playbackController.setPlayer(player);
             player.addObserver(new MPVLib.EventObserver() {
                 @Override public void event(int eventId) {
-                    ui.post(() -> handleMpvEvent(eventId));
+                    ui.post(() -> {
+                        if (observerSession != mpvSessionId || destroyed) return;
+                        handleMpvEvent(eventId);
+                    });
                 }
 
                 @Override public void eventProperty(String name) {
-                    ui.post(() -> updateDebugPanel());
+                    ui.post(() -> {
+                        if (observerSession != mpvSessionId || destroyed) return;
+                        updateDebugPanel();
+                    });
                 }
 
                 @Override public void eventProperty(String name, boolean value) {
                     ui.post(() -> {
+                        if (observerSession != mpvSessionId || destroyed) return;
                         if ("paused-for-cache".equals(name)) debugPausedForCache = value;
                         else if ("core-idle".equals(name)) debugCoreIdle = value;
                         else if ("eof-reached".equals(name)) debugEof = value;
@@ -312,6 +325,7 @@ public class MainActivity extends Activity {
 
                 @Override public void eventProperty(String name, long value) {
                     ui.post(() -> {
+                        if (observerSession != mpvSessionId || destroyed) return;
                         if ("width".equals(name)) debugWidth = value;
                         else if ("height".equals(name)) debugHeight = value;
                         updateDebugPanel();
@@ -320,6 +334,7 @@ public class MainActivity extends Activity {
 
                 @Override public void eventProperty(String name, double value) {
                     ui.post(() -> {
+                        if (observerSession != mpvSessionId || destroyed) return;
                         if ("cache-buffering-state".equals(name)) debugBufferPercent = value;
                         else if ("demuxer-cache-duration".equals(name)) debugCacheSeconds = value;
                         else if ("time-pos".equals(name)) {
@@ -341,6 +356,7 @@ public class MainActivity extends Activity {
 
                 @Override public void eventProperty(String name, String value) {
                     ui.post(() -> {
+                        if (observerSession != mpvSessionId || destroyed) return;
                         if ("video-codec".equals(name)) debugVideoCodec = value == null ? "-" : value;
                         else if ("video-format".equals(name)) debugVideoFormat = value == null ? "-" : value;
                         else if ("audio-codec-name".equals(name)) debugAudioCodec = value == null ? "-" : value;
@@ -599,60 +615,50 @@ public class MainActivity extends Activity {
         final MPVLib old = player;
         if (old != null) playbackController.clearPlayer(old);
 
-        new Thread(() -> {
-            try {
-                // 旧 session 只做尽力清理；即使某个 native stop 卡住，也不能阻塞新的 PlaybackController。
-                if (old != null) {
-                    try { old.detachSurface(); } catch (Throwable ignored) {}
-                    try { old.destroy(); } catch (Throwable ignored) {}
-                }
+        // 立即让旧 session 失效，防止它迟到的事件污染新频道状态。
+        mpvSessionId++;
+        player = null;
+        mpvInitialized = false;
 
-                if (!playbackController.isCurrent(expectedGeneration) || destroyed) {
-                    ui.post(() -> playerCoreRestarting = false);
-                    return;
-                }
+        // 旧 MPV 的清理由独立线程尽力完成；即使 native destroy 卡住，
+        // 也不能阻塞新的播放控制线程和用户 ↑/↓。
+        if (old != null) {
+            Thread cleanup = new Thread(() -> {
+                try { old.detachSurface(); } catch (Throwable ignored) {}
+                try { old.destroy(); } catch (Throwable ignored) {}
+            }, "old-mpv-cleanup");
+            cleanup.setDaemon(true);
+            cleanup.start();
+        }
 
-                player = null;
-                mpvInitialized = false;
-                try { Thread.sleep(180); } catch (InterruptedException ignored) {}
-
-                ui.post(() -> {
-                    if (destroyed || playbackController == null ||
-                            !playbackController.isCurrent(expectedGeneration)) {
-                        playerCoreRestarting = false;
-                        return;
-                    }
-
-                    SurfaceHolder holder = playerView.getHolder();
-                    if (holder == null || holder.getSurface() == null || !holder.getSurface().isValid()) {
-                        playerCoreRestarting = false;
-                        pendingPlay = true;
-                        debugStage = "等待 Surface 后重建播放器";
-                        updateDebugPanel();
-                        return;
-                    }
-
-                    resetAttemptTelemetry(false);
-                    debugStage = "播放器会话已重建";
-                    initMpvIfNeeded(holder);
-                    playerCoreRestarting = false;
-
-                    if (player != null && mpvInitialized &&
-                            playbackController.isCurrent(expectedGeneration) &&
-                            current >= 0 && current < channels.size()) {
-                        playbackController.reloadAfterPlayerRebuild(
-                                channels.get(current), expectedGeneration);
-                    }
-                });
-            } catch (Throwable e) {
-                ui.post(() -> {
-                    playerCoreRestarting = false;
-                    debugStage = "播放器会话重建失败";
-                    statusTextSafe("播放器重建失败：" + e.getClass().getSimpleName());
-                    updateDebugPanel();
-                });
+        ui.postDelayed(() -> {
+            if (destroyed || playbackController == null ||
+                    !playbackController.isCurrent(expectedGeneration)) {
+                playerCoreRestarting = false;
+                return;
             }
-        }, "mpv-session-rebuild").start();
+
+            SurfaceHolder holder = playerView.getHolder();
+            if (holder == null || holder.getSurface() == null || !holder.getSurface().isValid()) {
+                playerCoreRestarting = false;
+                pendingPlay = true;
+                debugStage = "等待 Surface 后重建播放器";
+                updateDebugPanel();
+                return;
+            }
+
+            resetAttemptTelemetry(false);
+            debugStage = "播放器会话已重建";
+            initMpvIfNeeded(holder);
+            playerCoreRestarting = false;
+
+            if (player != null && mpvInitialized &&
+                    playbackController.isCurrent(expectedGeneration) &&
+                    current >= 0 && current < channels.size()) {
+                playbackController.reloadAfterPlayerRebuild(
+                        channels.get(current), expectedGeneration);
+            }
+        }, 180);
     }
 
     private synchronized void handlePlaybackStall(String reason) {
@@ -709,6 +715,7 @@ public class MainActivity extends Activity {
 
         final Channel oldChannel = (current >= 0 && current < channels.size()) ? channels.get(current) : null;
         final int oldIndex = current;
+        final int requestGeneration = playbackGeneration;
         debugStage = "自动恢复：缓存播放失败，后台更新订阅";
         status.setText(reason + "\n缓存频道播放失败，正在后台更新订阅…");
         status.setVisibility(View.VISIBLE);
@@ -722,6 +729,15 @@ public class MainActivity extends Activity {
 
                 ui.post(() -> {
                     if (destroyed) return;
+
+                    // 用户在订阅下载期间已经按 ↑/↓ 换台，则旧恢复结果直接作废。
+                    if (playbackController == null ||
+                            !playbackController.isCurrent(requestGeneration) ||
+                            playbackGeneration != requestGeneration) {
+                        playbackRefreshInProgress = false;
+                        return;
+                    }
+
                     int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
                     stagePendingCache(resolved);
                     setChannels(resolved.channels);
@@ -744,6 +760,10 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 final String err = friendlyError(e);
                 ui.post(() -> {
+                    if (playbackGeneration != requestGeneration) {
+                        playbackRefreshInProgress = false;
+                        return;
+                    }
                     playbackRefreshInProgress = false;
                     debugStage = "自动更新订阅失败";
                     showCurrentChannelUnavailable("后台更新订阅失败：" + err);
@@ -1355,6 +1375,7 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy() {
         destroyed = true;
+        mpvSessionId++;
         playToken.incrementAndGet();
         ui.removeCallbacksAndMessages(null);
         if (playbackController != null) {
