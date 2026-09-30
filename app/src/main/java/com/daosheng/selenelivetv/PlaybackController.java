@@ -23,7 +23,7 @@ public final class PlaybackController {
         void onControllerBlocked(long blockedMs, int generation);
     }
 
-    private final ThreadPoolExecutor executor;
+    private volatile ThreadPoolExecutor executor;
     private final Thread watchdogThread;
     private final AtomicInteger generation = new AtomicInteger(0);
     private final Listener listener;
@@ -36,17 +36,7 @@ public final class PlaybackController {
 
     public PlaybackController(Listener listener) {
         this.listener = listener;
-        this.executor = new ThreadPoolExecutor(
-                1, 1,
-                0L, TimeUnit.MILLISECONDS,
-                new LinkedBlockingQueue<>(),
-                r -> {
-                    Thread t = new Thread(r, "playback-controller");
-                    t.setDaemon(true);
-                    return t;
-                }
-        );
-        this.executor.prestartAllCoreThreads();
+        this.executor = createExecutor();
 
         watchdogThread = new Thread(() -> {
             while (!shutdown) {
@@ -71,6 +61,43 @@ public final class PlaybackController {
         watchdogThread.start();
     }
 
+    private ThreadPoolExecutor createExecutor() {
+        ThreadPoolExecutor ex = new ThreadPoolExecutor(
+                1, 1,
+                0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(),
+                r -> {
+                    Thread t = new Thread(r, "playback-controller");
+                    t.setDaemon(true);
+                    return t;
+                }
+        );
+        ex.prestartAllCoreThreads();
+        return ex;
+    }
+
+    /**
+     * 当 watchdog 确认控制线程卡在 native 调用里时，放弃旧 worker。
+     * 旧 JNI 调用即使稍后返回，也因为 generation 已改变而不能再影响当前频道。
+     */
+    public synchronized int abandonBlockedWorker() {
+        if (shutdown) return generation.get();
+
+        ThreadPoolExecutor old = executor;
+        int gen = generation.incrementAndGet();
+        executor = createExecutor();
+
+        if (old != null) {
+            old.getQueue().clear();
+            old.shutdownNow();
+        }
+
+        activeGeneration = gen;
+        commandStartedAt = 0L;
+        reportedBlockedGeneration = -1;
+        return gen;
+    }
+
     public void setPlayer(MPVLib player) {
         this.player = player;
     }
@@ -89,7 +116,8 @@ public final class PlaybackController {
      */
     public int switchChannel(Channel channel) {
         final int gen = generation.incrementAndGet();
-        executor.getQueue().clear();
+        ThreadPoolExecutor ex = executor;
+        ex.getQueue().clear();
         reportedBlockedGeneration = -1;
 
         submit(gen, () -> {
@@ -204,7 +232,8 @@ public final class PlaybackController {
     }
 
     private void submit(int gen, ThrowingRunnable action) {
-        executor.execute(() -> {
+        ThreadPoolExecutor ex = executor;
+        ex.execute(() -> {
             if (!isCurrent(gen)) return;
             activeGeneration = gen;
             commandStartedAt = System.currentTimeMillis();
@@ -233,8 +262,9 @@ public final class PlaybackController {
     public void shutdown() {
         shutdown = true;
         generation.incrementAndGet();
-        executor.getQueue().clear();
-        executor.shutdownNow();
+        ThreadPoolExecutor ex = executor;
+        ex.getQueue().clear();
+        ex.shutdownNow();
         watchdogThread.interrupt();
         player = null;
     }
