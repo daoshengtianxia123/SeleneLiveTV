@@ -42,6 +42,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class MainActivity extends Activity {
     public static final String DEFAULT_SUB_URL =
             "https://gitee.com/daoshengtianxia/selene-iptv/raw/main/selene-sub.txt";
+    private static final String OLD_DEFAULT_SUB_URL =
+            "https://raw.githubusercontent.com/daoshengtianxia123/selene-iptv/main/selene-sub.txt";
     public static final String PREFS = "selene_live_prefs";
     public static final String KEY_SUB_URL = "subscription_url";
     private static final String KEY_CACHE = "playlist_cache";
@@ -100,6 +102,7 @@ public class MainActivity extends Activity {
     private volatile boolean playbackRefreshInProgress = false;
     private volatile boolean playbackRefreshTried = false;
     private volatile boolean autoNextScheduled = false;
+    private volatile long lastPlaybackTriggeredRefreshAt = 0L;
     private volatile long channelAttemptStartedAt = 0L;
     private volatile String playlistSource = "未加载";
 
@@ -117,8 +120,12 @@ public class MainActivity extends Activity {
     }
 
     public static String getSubscriptionUrl(Context c) {
-        return c.getSharedPreferences(PREFS, MODE_PRIVATE)
+        String value = c.getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getString(KEY_SUB_URL, DEFAULT_SUB_URL);
+        if (value == null || value.trim().isEmpty() || OLD_DEFAULT_SUB_URL.equals(value.trim())) {
+            return DEFAULT_SUB_URL;
+        }
+        return value.trim();
     }
 
     private void buildUi() {
@@ -468,33 +475,40 @@ public class MainActivity extends Activity {
 
     private void checkPlaybackRecovery() {
         if (destroyed || channels.isEmpty() || player == null || !mpvInitialized || !surfaceReady) return;
+        long now = System.currentTimeMillis();
+
         if (playbackHealthy) {
-            // 已经进入 PLAYBACK_RESTART 后，如果 time-pos 又长时间不增长，也视为卡死。
-            if (debugLastProgressAt > 0 &&
-                    System.currentTimeMillis() - debugLastProgressAt > 8000 &&
-                    !debugPausedForCache) {
+            long noProgressMs = debugLastProgressAt > 0 ? now - debugLastProgressAt : 0;
+
+            // 正常播放后又进入长期缓冲，也必须自动恢复，不能永久卡住。
+            if (debugPausedForCache && noProgressMs >= 12000) {
+                handlePlaybackStall("播放中连续缓冲超过12秒");
+                return;
+            }
+
+            // 已经播放过，但时间轴超过8秒不增长。
+            if (!debugPausedForCache && noProgressMs >= 8000) {
                 handlePlaybackStall("播放时间超过8秒没有增长");
             }
             return;
         }
 
-        long elapsed = System.currentTimeMillis() - channelAttemptStartedAt;
+        long elapsed = now - channelAttemptStartedAt;
         if (channelAttemptStartedAt <= 0) return;
 
-        // 已打开流、识别到视频参数，但始终无法真正开始播放：与你截图中的状态一致。
-        if (debugFileLoaded && debugWidth > 0 && debugHeight > 0 &&
-                debugTimePos <= 0.05 && elapsed >= 6000) {
-            handlePlaybackStall("已打开H.264视频但6秒仍未开始播放");
-            return;
-        }
-
-        // 连 FILE_LOADED 都没有：多数是旧地址、网络或服务器问题。
+        // 阶段1：连 FILE_LOADED 都没有。
         if (!debugFileLoaded && elapsed >= 9000) {
-            handlePlaybackStall("直播地址9秒仍未打开");
+            handlePlaybackStall("阶段1/4：直播地址9秒仍未打开");
             return;
         }
 
-        // 长时间一直缓冲也触发恢复。
+        // 阶段2：已经 FILE_LOADED，但一直没有真正开始播放。
+        // 不再要求先拿到 width/height，否则部分异常流会永远停在2/4。
+        if (debugFileLoaded && debugTimePos <= 0.05 && elapsed >= 10000) {
+            handlePlaybackStall("阶段2/4：直播流已打开但10秒仍未开始播放");
+            return;
+        }
+
         if (debugPausedForCache && elapsed >= 12000) {
             handlePlaybackStall("网络缓冲超过12秒");
         }
@@ -523,11 +537,18 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 软件解码仍然失败：认为当前缓存中的直播地址可能已经失效，后台刷新订阅。
+        // 软件解码仍然失败：后台刷新一次订阅。
+        // 为避免连续坏台时每个频道都请求 Gitee，播放故障触发的订阅刷新至少间隔60秒。
         if (!playbackRefreshTried && !playbackRefreshInProgress) {
-            playbackRefreshTried = true;
-            refreshSubscriptionAfterPlaybackFailure(reason);
-            return;
+            long now = System.currentTimeMillis();
+            if (now - lastPlaybackTriggeredRefreshAt >= 60000L) {
+                playbackRefreshTried = true;
+                lastPlaybackTriggeredRefreshAt = now;
+                refreshSubscriptionAfterPlaybackFailure(reason);
+                return;
+            } else {
+                playbackRefreshTried = true;
+            }
         }
 
         // 当前频道软件解码 + 订阅刷新都试过仍失败，无人值守场景自动换下一个频道。
@@ -571,7 +592,7 @@ public class MainActivity extends Activity {
                     int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
                     setChannels(resolved.channels);
                     current = newIndex;
-                    playlistSource = "网络更新成功";
+                    playlistSource = "Gitee/网络更新成功";
                     playbackRefreshInProgress = false;
                     playbackRefreshTried = true;
 
