@@ -62,6 +62,15 @@ public class Channel {
         return true;
     }
 
+    public synchronized boolean selectUrl(String preferredUrl) {
+        if (preferredUrl == null || preferredUrl.trim().isEmpty()) return false;
+        int index = urls.indexOf(preferredUrl.trim());
+        if (index < 0) return false;
+        lineIndex = index;
+        url = urls.get(lineIndex);
+        return true;
+    }
+
     public synchronized void resetPrimaryLine() {
         if (urls.isEmpty()) return;
         lineIndex = 0;
