@@ -103,6 +103,8 @@ public class MainActivity extends Activity {
     private volatile boolean forceSoftwareDecode = false;
     private volatile boolean playbackRefreshInProgress = false;
     private volatile boolean playbackRefreshTried = false;
+    private volatile boolean playerCoreRestartTried = false;
+    private volatile boolean playerCoreRestarting = false;
     private volatile long lastPlaybackTriggeredRefreshAt = 0L;
     private volatile long channelAttemptStartedAt = 0L;
     private volatile String playlistSource = "未加载";
@@ -446,9 +448,10 @@ public class MainActivity extends Activity {
                 "视频：" + debugVideoCodec + " / " + debugVideoFormat + " / " + resolution + "\n" +
                 "音频：" + debugAudioCodec + "\n" +
                 "时间：" + pos + "  cache=" + debugPausedForCache + "\n" +
-                "恢复：" + (playbackRefreshInProgress ? "正在更新订阅" :
+                "恢复：" + (playerCoreRestarting ? "正在重建播放器" :
+                        (playbackRefreshInProgress ? "正在更新订阅" :
                         (softwareFallbackUsed ? "已尝试软件解码" :
-                                (streamReconnectCount > 0 ? "已重连直播源" : "未触发"))) + "\n" +
+                                (streamReconnectCount > 0 ? "已重连直播源" : "未触发")))) + "\n" +
                 detectPlaybackProblem()
         );
     }
@@ -497,6 +500,14 @@ public class MainActivity extends Activity {
         long elapsed = now - channelAttemptStartedAt;
         if (channelAttemptStartedAt <= 0) return;
 
+        // 连 START_FILE 都没有回来，说明不是普通网络首包慢，
+        // 更像 MPV core/上一解码器状态没有正确退出。只重建播放器，不换频道。
+        if ("-".equals(debugLastEvent) && elapsed >= 5000 &&
+                !playerCoreRestartTried && !playerCoreRestarting) {
+            restartPlayerCoreForCurrentChannel("loadfile 5秒没有收到 START_FILE");
+            return;
+        }
+
         // 阶段1：还没有 FILE_LOADED，本质是连接直播服务器/打开URL问题。
         if (!debugFileLoaded && elapsed >= 8000) {
             handlePlaybackStall("阶段1/4：直播地址8秒仍未打开");
@@ -519,6 +530,69 @@ public class MainActivity extends Activity {
         if (debugPausedForCache && elapsed >= 12000) {
             handlePlaybackStall("网络缓冲超过12秒");
         }
+    }
+
+    private synchronized void restartPlayerCoreForCurrentChannel(String reason) {
+        if (destroyed || channels.isEmpty() || playerCoreRestarting) return;
+
+        playerCoreRestartTried = true;
+        playerCoreRestarting = true;
+        if (debugView != null) debugView.setVisibility(View.VISIBLE);
+        debugStage = "自动恢复：正在重建播放器内核";
+        status.setText(reason + "\n正在重启播放器并继续当前频道…");
+        status.setVisibility(View.VISIBLE);
+        updateDebugPanel();
+
+        final int token = playToken.incrementAndGet();
+        final Channel ch = channels.get(current);
+
+        playerExecutor.execute(() -> {
+            MPVLib old = player;
+            try {
+                if (old != null) {
+                    try { old.command(new String[]{"stop"}); } catch (Throwable ignored) {}
+                    try { old.detachSurface(); } catch (Throwable ignored) {}
+                    try { old.destroy(); } catch (Throwable ignored) {}
+                }
+
+                player = null;
+                mpvInitialized = false;
+                try { Thread.sleep(220); } catch (InterruptedException ignored) {}
+
+                ui.post(() -> {
+                    if (destroyed || token != playToken.get()) {
+                        playerCoreRestarting = false;
+                        return;
+                    }
+                    SurfaceHolder holder = playerView.getHolder();
+                    if (holder == null || holder.getSurface() == null || !holder.getSurface().isValid()) {
+                        playerCoreRestarting = false;
+                        pendingPlay = true;
+                        debugStage = "等待 Surface 后重建播放器";
+                        updateDebugPanel();
+                        return;
+                    }
+
+                    // initMpvIfNeeded 会重新创建 observer、绑定 Surface。
+                    resetAttemptTelemetry(false);
+                    debugStage = "播放器已重建，准备继续当前频道";
+                    initMpvIfNeeded(holder);
+                    playerCoreRestarting = false;
+
+                    // initMpvIfNeeded 可能已经因为 channels 非空自动 queue 一次，
+                    // 因此这里只在没有 pending 的情况下不再重复发第二次。
+                    status.setText("播放器已重建，正在重试：" + ch.name);
+                    status.setVisibility(View.VISIBLE);
+                });
+            } catch (Throwable e) {
+                ui.post(() -> {
+                    playerCoreRestarting = false;
+                    debugStage = "播放器内核重建失败";
+                    statusTextSafe("播放器重建失败：" + e.getClass().getSimpleName());
+                    updateDebugPanel();
+                });
+            }
+        });
     }
 
     private synchronized void handlePlaybackStall(String reason) {
@@ -736,6 +810,8 @@ public class MainActivity extends Activity {
 
         if (resetRecoveryFlags) {
             softwareFallbackUsed = false;
+            playerCoreRestartTried = false;
+            playerCoreRestarting = false;
             forceSoftwareDecode = false;
             playbackRefreshTried = false;
             playbackRefreshInProgress = false;
@@ -1158,7 +1234,51 @@ public class MainActivity extends Activity {
             status.setVisibility(View.VISIBLE);
             return;
         }
-        queuePlayCurrent();
+        queueManualChannelSwitch();
+    }
+
+    private void queueManualChannelSwitch() {
+        if (channels.isEmpty() || destroyed) return;
+        final int token = playToken.incrementAndGet();
+        final Channel ch = channels.get(current);
+        pendingPlay = false;
+
+        playerExecutor.execute(() -> {
+            if (destroyed || token != playToken.get() || !surfaceReady || player == null || !mpvInitialized) return;
+            try {
+                ui.post(() -> {
+                    debugStage = "切台：正在释放上一直播流";
+                    updateDebugPanel();
+                });
+
+                // 人工切台也先彻底 stop，避免旧 HTTP/demux/MediaCodec 状态叠加。
+                try { player.command(new String[]{"stop"}); } catch (Throwable ignored) {}
+                try { Thread.sleep(180); } catch (InterruptedException ignored) {}
+
+                try { player.setPropertyString("hwdec", "auto-safe"); } catch (Throwable ignored) {}
+                forceSoftwareDecode = false;
+
+                ui.post(() -> {
+                    debugStage = "切台：已清理旧流，等待 START_FILE";
+                    updateDebugPanel();
+                });
+
+                player.command(new String[]{"loadfile", ch.url, "replace"});
+                player.setPropertyBoolean("pause", false);
+
+                ui.post(() -> {
+                    if (!destroyed && token == playToken.get()) playerView.requestFocus();
+                });
+            } catch (Throwable e) {
+                ui.post(() -> {
+                    if (!destroyed && token == playToken.get()) {
+                        debugStage = "切台命令异常";
+                        statusTextSafe("切台失败：" + e.getClass().getSimpleName());
+                        updateDebugPanel();
+                    }
+                });
+            }
+        });
     }
 
     private void queuePlayCurrent() {
