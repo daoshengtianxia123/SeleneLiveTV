@@ -99,15 +99,11 @@ public class MainActivity extends Activity {
     // 本地缓存先播；异常时只重连当前频道/重建播放器/刷新订阅。
     // 不再自动切软件解码，避免恢复动作反而把播放器卡住。
     private volatile boolean playbackHealthy = false;
-    private volatile boolean softwareFallbackUsed = false;
-    private volatile boolean forceSoftwareDecode = false;
     private volatile boolean playbackRefreshInProgress = false;
     private volatile boolean playbackRefreshTried = false;
-    private volatile boolean playerCoreRestartTried = false;
-    private volatile boolean playerCoreRestarting = false;
-    private volatile long lastPlaybackTriggeredRefreshAt = 0L;
     private volatile long channelAttemptStartedAt = 0L;
     private volatile long lastManualSwitchAt = 0L;
+    private volatile boolean stallWarningShown = false;
     private volatile String playlistSource = "未加载";
 
     // 网络更新先作为“候选列表”试播，只有真正稳定播放后才覆盖已验证本地缓存。
@@ -141,23 +137,6 @@ public class MainActivity extends Activity {
                     debugStage = "播放控制命令失败";
                     statusTextSafe("播放器控制失败：" + message);
                     updateDebugPanel();
-                });
-            }
-
-            @Override public void onControllerBlocked(long blockedMs, int generation) {
-                ui.post(() -> {
-                    if (destroyed || playbackController == null) return;
-                    if (!playbackController.isCurrent(generation)) return;
-                    if (playerCoreRestarting) return;
-
-                    debugStage = "播放控制线程疑似卡住";
-                    statusTextSafe("播放器响应超时，正在重建当前播放会话…");
-                    updateDebugPanel();
-
-                    // 放弃被 JNI 卡住的旧 worker，建立新的控制线程代际。
-                    playbackGeneration = playbackController.abandonBlockedWorker();
-                    restartPlayerCoreForCurrentChannel(
-                            "播放控制命令卡住 " + (blockedMs / 1000) + " 秒");
                 });
             }
         });
@@ -423,9 +402,7 @@ public class MainActivity extends Activity {
                 break;
             case 7: // END_FILE
                 debugStage = "直播流已结束/断开";
-                if (!playbackHealthy) {
-                    ui.postDelayed(() -> handlePlaybackStall("直播流已结束/断开"), 300);
-                }
+                ui.postDelayed(() -> handlePlaybackStall("直播流已结束/断开"), 300);
                 break;
             case 24: // QUEUE_OVERFLOW
                 debugStage = "MPV事件队列溢出";
@@ -504,9 +481,7 @@ public class MainActivity extends Activity {
                 "视频：" + debugVideoCodec + " / " + debugVideoFormat + " / " + resolution + "\n" +
                 "音频：" + debugAudioCodec + "\n" +
                 "时间：" + pos + "  cache=" + debugPausedForCache + "\n" +
-                "恢复：" + (playerCoreRestarting ? "正在重建播放器" :
-                        (playbackRefreshInProgress ? "正在更新订阅" :
-                                (streamReconnectCount > 0 ? "已重连当前频道" : "未触发"))) + "\n" +
+                "恢复：不自动重建/不自动软解\n" +
                 detectPlaybackProblem()
         );
     }
@@ -547,248 +522,63 @@ public class MainActivity extends Activity {
 
     private void checkPlaybackRecovery() {
         if (destroyed || channels.isEmpty() || player == null || !mpvInitialized || !surfaceReady) return;
+        if (stallWarningShown) return;
+
         long now = System.currentTimeMillis();
+        long elapsed = channelAttemptStartedAt > 0 ? now - channelAttemptStartedAt : 0;
 
         if (playbackHealthy) {
             long noProgressMs = debugLastProgressAt > 0 ? now - debugLastProgressAt : 0;
-
-            if (debugPausedForCache && noProgressMs >= 10000) {
-                handlePlaybackStall("播放中连续缓冲超过10秒");
+            if (debugPausedForCache && noProgressMs >= 12000) {
+                handlePlaybackStall("网络缓冲时间较长");
                 return;
             }
-
-            if (!debugPausedForCache && noProgressMs >= 8000) {
-                handlePlaybackStall("播放时间超过8秒没有增长");
+            if (!debugPausedForCache && noProgressMs >= 10000) {
+                handlePlaybackStall("播放时间长时间没有增长");
             }
             return;
         }
 
-        long elapsed = now - channelAttemptStartedAt;
-        if (channelAttemptStartedAt <= 0) return;
-
-        // 连 START_FILE 都没有回来，说明不是普通网络首包慢，
-        // 更像 MPV core/上一解码器状态没有正确退出。只重建播放器，不换频道。
-        if ("-".equals(debugLastEvent) && elapsed >= 5000 &&
-                !playerCoreRestartTried && !playerCoreRestarting) {
-            restartPlayerCoreForCurrentChannel("loadfile 5秒没有收到 START_FILE");
+        // 启动阶段只做提示，不再自动 stop / destroy / 重建 MPV。
+        if (!debugFileLoaded && elapsed >= 12000) {
+            handlePlaybackStall("当前直播地址连接较慢");
             return;
         }
 
-        // 阶段1：还没有 FILE_LOADED，本质是连接直播服务器/打开URL问题。
-        if (!debugFileLoaded && elapsed >= 8000) {
-            handlePlaybackStall("阶段1/4：直播地址8秒仍未打开");
+        if (debugFileLoaded && !debugVideoReady && elapsed >= 15000) {
+            handlePlaybackStall("直播流已打开，但视频建立较慢");
             return;
         }
 
-        // 阶段2：已经打开容器，但视频解码器还没有真正建立。
-        // 国内运营商 TS/HLS 某些源会偶发关键帧/首包慢，给到12秒，再做“网络流重连”。
-        if (debugFileLoaded && !debugVideoReady && elapsed >= 12000) {
-            handlePlaybackStall("阶段2/4：直播流已打开但12秒仍未建立视频");
-            return;
+        if (debugVideoReady && debugTimePos <= 0.05 && elapsed >= 12000) {
+            handlePlaybackStall("视频已建立，但暂时没有开始播放");
         }
-
-        // 阶段3：视频解码器已经建立但时间轴不推进，仍只按当前频道异常处理，不自动切软件解码。
-        if (debugVideoReady && debugTimePos <= 0.05 && elapsed >= 8000) {
-            handlePlaybackStall("阶段3/4：视频解码已建立但8秒仍未开始播放");
-            return;
-        }
-
-        if (debugPausedForCache && elapsed >= 12000) {
-            handlePlaybackStall("网络缓冲超过12秒");
-        }
-    }
-
-    private synchronized void restartPlayerCoreForCurrentChannel(String reason) {
-        if (destroyed || channels.isEmpty() || playerCoreRestarting || playbackController == null) return;
-
-        final int expectedGeneration = playbackGeneration;
-        if (!playbackController.isCurrent(expectedGeneration)) return;
-
-        playerCoreRestartTried = true;
-        playerCoreRestarting = true;
-        if (debugView != null) debugView.setVisibility(View.VISIBLE);
-        debugStage = "自动恢复：正在重建播放器会话";
-        status.setText(reason + "\n正在重建播放器并继续当前频道…");
-        status.setVisibility(View.VISIBLE);
-        updateDebugPanel();
-
-        final MPVLib old = player;
-        if (old != null) playbackController.clearPlayer(old);
-
-        // 立即让旧 session 失效，防止它迟到的事件污染新频道状态。
-        mpvSessionId++;
-        player = null;
-        mpvInitialized = false;
-
-        // 旧 MPV 的清理由独立线程尽力完成；即使 native destroy 卡住，
-        // 也不能阻塞新的播放控制线程和用户 ↑/↓。
-        if (old != null) {
-            Thread cleanup = new Thread(() -> {
-                try { old.detachSurface(); } catch (Throwable ignored) {}
-                try { old.destroy(); } catch (Throwable ignored) {}
-            }, "old-mpv-cleanup");
-            cleanup.setDaemon(true);
-            cleanup.start();
-        }
-
-        ui.postDelayed(() -> {
-            if (destroyed || playbackController == null ||
-                    !playbackController.isCurrent(expectedGeneration)) {
-                playerCoreRestarting = false;
-                return;
-            }
-
-            SurfaceHolder holder = playerView.getHolder();
-            if (holder == null || holder.getSurface() == null || !holder.getSurface().isValid()) {
-                playerCoreRestarting = false;
-                pendingPlay = true;
-                debugStage = "等待 Surface 后重建播放器";
-                updateDebugPanel();
-                return;
-            }
-
-            resetAttemptTelemetry(false);
-            debugStage = "播放器会话已重建";
-            initMpvIfNeeded(holder);
-            playerCoreRestarting = false;
-
-            if (player != null && mpvInitialized &&
-                    playbackController.isCurrent(expectedGeneration) &&
-                    current >= 0 && current < channels.size()) {
-                playbackController.reloadAfterPlayerRebuild(
-                        channels.get(current), expectedGeneration);
-            }
-        }, 180);
     }
 
     private synchronized void handlePlaybackStall(String reason) {
-        if (destroyed || channels.isEmpty()) return;
+        if (destroyed || channels.isEmpty() || stallWarningShown) return;
 
-        if (playbackHealthy) {
-            playbackHealthy = false;
-            debugHealthySince = 0L;
-        }
+        stallWarningShown = true;
+        playbackHealthy = false;
+        debugHealthySince = 0L;
+        debugStage = "当前频道网络/直播源异常";
         if (debugView != null) debugView.setVisibility(View.VISIBLE);
 
-        // 不自动切软件解码。任何阶段卡住都只允许对“当前频道”做一次干净重连。
-        if (streamReconnectCount < 1) {
-            streamReconnectCount++;
-            forceSoftwareDecode = false;
-            softwareFallbackUsed = false;
-            debugStage = "自动恢复：重连当前频道 1/1";
-            status.setText(reason + "\n正在重新连接当前频道…");
-            status.setVisibility(View.VISIBLE);
-            updateDebugPanel();
-            resetAttemptTelemetry(false);
-            queueCleanReconnectCurrent();
-            return;
-        }
-
-        // 当前频道重连仍失败，再后台刷新订阅，尝试同名频道的新URL。
-        if (!playbackRefreshTried && !playbackRefreshInProgress) {
-            long now = System.currentTimeMillis();
-            if (now - lastPlaybackTriggeredRefreshAt >= 60000L) {
-                playbackRefreshTried = true;
-                lastPlaybackTriggeredRefreshAt = now;
-                refreshSubscriptionAfterPlaybackFailure(reason);
-                return;
-            }
-            playbackRefreshTried = true;
-        }
-
-        // 仍失败只提示，不换台、不切软解，等待用户按上下键。
-        if (playbackRefreshTried && !playbackRefreshInProgress) {
-            showCurrentChannelUnavailable(reason);
-        }
+        String name = current >= 0 && current < channels.size()
+                ? channels.get(current).name : "当前频道";
+        status.setText(
+                name + " 暂时无法流畅播放\n" +
+                reason + "\n" +
+                "请按 ↑ / ↓ 手动切换频道"
+        );
+        status.setVisibility(View.VISIBLE);
+        updateDebugPanel();
     }
 
     private void queueCleanReconnectCurrent() {
         if (channels.isEmpty() || destroyed || playbackController == null) return;
         if (current < 0 || current >= channels.size()) return;
         playbackController.reconnectCurrent(channels.get(current), playbackGeneration);
-    }
-
-    private void refreshSubscriptionAfterPlaybackFailure(String reason) {
-        if (playbackRefreshInProgress || destroyed || channels.isEmpty()) return;
-        playbackRefreshInProgress = true;
-        if (debugView != null) debugView.setVisibility(View.VISIBLE);
-
-        final Channel oldChannel = (current >= 0 && current < channels.size()) ? channels.get(current) : null;
-        final int oldIndex = current;
-        final int requestGeneration = playbackGeneration;
-        debugStage = "自动恢复：缓存播放失败，后台更新订阅";
-        status.setText(reason + "\n缓存频道播放失败，正在后台更新订阅…");
-        status.setVisibility(View.VISIBLE);
-        updateDebugPanel();
-
-        final String sub = getSubscriptionUrl(this);
-        new Thread(() -> {
-            try {
-                ResolvedPlaylist resolved = resolveSubscription(sub);
-                if (resolved.channels.isEmpty()) throw new IllegalStateException("新订阅没有有效频道");
-
-                ui.post(() -> {
-                    if (destroyed) return;
-
-                    // 用户在订阅下载期间已经按 ↑/↓ 换台，则旧恢复结果直接作废。
-                    if (playbackController == null ||
-                            !playbackController.isCurrent(requestGeneration) ||
-                            playbackGeneration != requestGeneration) {
-                        playbackRefreshInProgress = false;
-                        return;
-                    }
-
-                    int newIndex = findSameChannelIndex(resolved.channels, oldChannel, oldIndex);
-                    stagePendingCache(resolved, true);
-                    setChannels(resolved.channels);
-                    current = newIndex;
-                    playlistSource = "Gitee候选列表（等待播放验证）";
-                    playbackRefreshInProgress = false;
-                    playbackRefreshTried = true;
-
-                    // 新地址重新从自动/硬解开始，不沿用前一次软件解码状态。
-                    forceSoftwareDecode = false;
-                    softwareFallbackUsed = false;
-                    streamReconnectCount = 0;
-                    playbackHealthy = false;
-                    debugStage = "订阅更新成功，正在用新地址重播";
-                    status.setText("订阅已更新，正在重新播放：" +
-                            (channels.isEmpty() ? "" : channels.get(current).name));
-                    status.setVisibility(View.VISIBLE);
-                    playCurrentAfterRefresh();
-                });
-            } catch (Exception e) {
-                final String err = friendlyError(e);
-                ui.post(() -> {
-                    if (playbackGeneration != requestGeneration) {
-                        playbackRefreshInProgress = false;
-                        return;
-                    }
-                    playbackRefreshInProgress = false;
-                    debugStage = "自动更新订阅失败";
-                    showCurrentChannelUnavailable("后台更新订阅失败：" + err);
-                });
-            }
-        }, "playback-recovery-subscription").start();
-    }
-
-    private void playCurrentAfterRefresh() {
-        if (channels.isEmpty()) return;
-        resetAttemptTelemetry(false);
-        // 这次已经完成过一次订阅刷新，若新地址仍失败则不要死循环刷新。
-        playbackRefreshTried = true;
-        playbackRefreshInProgress = false;
-        softwareFallbackUsed = false;
-        forceSoftwareDecode = false;
-        queuePlayCurrent();
-
-        // 新订阅地址仍无法播放时，只提示，不自动切台。
-        final int generation = playbackGeneration;
-        ui.postDelayed(() -> {
-            if (!destroyed && generation == playbackGeneration && !playbackHealthy) {
-                showCurrentChannelUnavailable("当前频道恢复后仍未正常播放");
-            }
-        }, 12000);
     }
 
     private void showCurrentChannelUnavailable(String reason) {
@@ -814,6 +604,7 @@ public class MainActivity extends Activity {
 
     private void resetAttemptTelemetry(boolean resetRecoveryFlags) {
         playbackHealthy = false;
+        stallWarningShown = false;
         debugFileLoaded = false;
         debugVideoReady = false;
         debugAudioReady = false;
@@ -835,11 +626,7 @@ public class MainActivity extends Activity {
         channelAttemptStartedAt = System.currentTimeMillis();
 
         if (resetRecoveryFlags) {
-            softwareFallbackUsed = false;
-            playerCoreRestartTried = false;
-            playerCoreRestarting = false;
-            forceSoftwareDecode = false;
-            playbackRefreshTried = false;
+                                                            playbackRefreshTried = false;
             playbackRefreshInProgress = false;
         }
         updateDebugPanel();
@@ -1306,23 +1093,6 @@ public class MainActivity extends Activity {
         if (current < 0 || current >= channels.size()) return;
         playbackGeneration = playbackController.switchChannel(channels.get(current));
         pendingPlay = false;
-    }
-
-    private void schedulePlaybackRetry(String reason) {
-        if (channels.isEmpty()) return;
-        final int generation = playbackGeneration;
-        if (playbackRetryCount >= 2) {
-            status.setText(reason + "\n当前频道播放失败，按 ↑ / ↓ 切换频道");
-            status.setVisibility(View.VISIBLE);
-            return;
-        }
-        playbackRetryCount++;
-        status.setText(reason + "\n正在自动重试 " + playbackRetryCount + "/2…");
-        status.setVisibility(View.VISIBLE);
-        ui.postDelayed(() -> {
-            if (generation != playbackGeneration || channels.isEmpty() || player == null) return;
-            queueCleanReconnectCurrent();
-        }, 1500);
     }
 
     private final Runnable hideOverlay = () -> overlay.setVisibility(View.GONE);
