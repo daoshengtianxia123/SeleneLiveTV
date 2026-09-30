@@ -10,8 +10,8 @@ android {
         applicationId 'com.daosheng.selenelivetv'
         minSdk 28
         targetSdk 35
-        versionCode 18
-        versionName '1.5.2-manual-channel-switch'
+        versionCode 19
+        versionName '1.5.3-clean-switch-core-restart'
         ndk { abiFilters 'armeabi-v7a' }
     }
 }
